@@ -160,6 +160,7 @@ EXTENSION is the temp file extension and COMMAND-FORM must return a command list
                  ("templ" . templ-ts)
                  ("racket" . racket)
                  ("babashka" . clojure)
+                 ("cljd" . clojure)
                  ("nbb" . clojure)
                  ("zig" . zig)))
   (add-to-list 'org-src-lang-modes entry))

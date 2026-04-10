@@ -22,14 +22,6 @@
        '(".git")
        (chief/polyglot-project-root))))
 
-(defun chief/jvm-project-root ()
-  "Return the current Java/Kotlin project root."
-  (chief/project-preferred-root
-   '("settings.gradle.kts" "settings.gradle")
-   '("pom.xml")
-   '("build.gradle.kts" "build.gradle")
-   (chief/polyglot-project-root)))
-
 (defun chief/ocaml-project-root ()
   "Return the current OCaml project root."
   (chief/project-preferred-root
@@ -42,13 +34,6 @@
   (or (chief/project-nearest-regexp-root "\\.sln\\'")
       (chief/project-nearest-regexp-root "\\.[cf]sproj\\'")
       (chief/polyglot-project-root)))
-
-(defun chief/dart-project-root ()
-  "Return the current Dart project root."
-  (chief/project-preferred-root
-   '("melos.yaml")
-   '("pubspec.yaml")
-   (chief/polyglot-project-root)))
 
 (defun chief/polyglot-compile (command name &optional directory)
   "Run COMMAND in DIRECTORY using compilation buffer NAME."
@@ -113,21 +98,6 @@
     (append (list "dotnet" verb)
             (when target (list target))
             args)))
-
-(defun chief/polyglot-gradle-executable ()
-  "Return the preferred Gradle executable for the current project."
-  (let* ((root (chief/jvm-project-root))
-         (wrapper (expand-file-name "gradlew" root)))
-    (cond
-     ((file-executable-p wrapper) wrapper)
-     ((executable-find "gradle") (executable-find "gradle"))
-     (t nil))))
-
-(defun chief/polyglot-gradle-command (&rest tasks)
-  "Return a Gradle command list built from TASKS."
-  (unless-let* ((gradle (chief/polyglot-gradle-executable)))
-    (user-error "Neither ./gradlew nor gradle is available"))
-  (cons gradle tasks))
 
 (defun chief/rust-project-root ()
   "Return the current Rust project root, if any."
@@ -262,32 +232,6 @@
     (user-error "swift is not available on PATH"))
   (chief/polyglot-compile '("swift" "run") "*swift run*" (chief/swift-project-root)))
 
-(defun chief/kotlin-build-project ()
-  "Run the default Gradle build for the current Kotlin project."
-  (interactive)
-  (chief/polyglot-compile (chief/polyglot-gradle-command "build") "*gradle build*" (chief/jvm-project-root)))
-
-(defun chief/kotlin-test-project ()
-  "Run the default Gradle test task for the current Kotlin project."
-  (interactive)
-  (chief/polyglot-compile (chief/polyglot-gradle-command "test") "*gradle test*" (chief/jvm-project-root)))
-
-(defun chief/kotlin-run-project ()
-  "Run the default Gradle run task for the current Kotlin project."
-  (interactive)
-  (chief/polyglot-compile (chief/polyglot-gradle-command "run") "*gradle run*" (chief/jvm-project-root)))
-
-(defun chief/kotlin-mode-build-command ()
-  "Return the preferred compile command string for Kotlin buffers."
-  (cond
-   ((file-exists-p (expand-file-name "build.gradle.kts" (chief/jvm-project-root)))
-    "gradle build")
-   ((file-exists-p (expand-file-name "build.gradle" (chief/jvm-project-root)))
-    "gradle build")
-   ((and buffer-file-name (string-match-p "\\.kts\\'" buffer-file-name))
-    (format "kotlinc -script %s" (shell-quote-argument (expand-file-name buffer-file-name))))
-   (t "gradle build")))
-
 (defun chief/lua-mode-setup ()
   "Configure REPL integration for Lua buffers."
   (chief/repl-configure
@@ -298,19 +242,6 @@
    :send-buffer #'lua-send-buffer
    :send-defun #'lua-send-defun
    :load-file #'lua-send-buffer))
-
-(defun chief/kotlin-mode-setup ()
-  "Configure REPL integration for Kotlin buffers."
-  (setq-local compile-command (chief/kotlin-mode-build-command))
-  (setq-local chief/lsp-root-function #'chief/jvm-project-root)
-  (chief/repl-configure
-   :start #'kotlin-repl
-   :restart #'kotlin-repl
-   :send-line #'kotlin-send-line
-   :send-region #'kotlin-send-region
-   :send-buffer #'kotlin-send-buffer
-   :send-defun #'kotlin-send-block
-   :load-file #'kotlin-send-buffer))
 
 (defun chief/swift-mode-setup ()
   "Configure REPL integration for Swift buffers."
@@ -513,26 +444,16 @@
   (setq-local compile-command "dotnet build")
   (setq-local chief/lsp-root-function #'chief/dotnet-project-root))
 
-(defun chief/java-mode-setup ()
-  "Configure Java buffers for monorepo-aware tooling."
-  (setq-local chief/lsp-root-function #'chief/jvm-project-root)
-  (setq-local compile-command
-              (cond
-               ((file-exists-p (expand-file-name "pom.xml" (chief/jvm-project-root)))
-                "mvn test")
-               ((or (file-exists-p (expand-file-name "build.gradle.kts" (chief/jvm-project-root)))
-                    (file-exists-p (expand-file-name "build.gradle" (chief/jvm-project-root))))
-                "gradle test")
-               (t "mvn test"))))
-
-(defun chief/dart-mode-setup ()
-  "Configure Dart buffers for monorepo-aware tooling."
-  (setq-local chief/lsp-root-function #'chief/dart-project-root))
+(autoload 'markdown-mode "markdown-mode" "Major mode for Markdown." t)
+(autoload 'gfm-mode "markdown-mode" "Major mode for GitHub Flavored Markdown." t)
+(add-to-list 'auto-mode-alist '("README\\.md\\'" . gfm-mode))
+(add-to-list 'auto-mode-alist '("\\.md\\'" . markdown-mode))
+(add-to-list 'auto-mode-alist '("\\.markdown\\'" . markdown-mode))
 
 (chief/safe-use-package markdown-mode
-  :mode ("README\\.md\\'" . gfm-mode)
-  :mode ("\\.md\\'" . markdown-mode)
-  :mode ("\\.markdown\\'" . markdown-mode))
+  :config
+  (setq markdown-fontify-code-blocks-natively t)
+  (setq markdown-hide-markup nil))
 
 (chief/safe-use-package yaml-mode
   :mode ("\\.ya?ml\\'" . yaml-mode))
@@ -565,15 +486,6 @@
 
 (chief/safe-use-package nix-mode
   :mode ("\\.nix\\'" . nix-mode))
-
-(chief/safe-use-package kotlin-mode
-  :mode ("\\.kt\\'" . kotlin-mode)
-  :mode ("\\.kts\\'" . kotlin-mode)
-  :hook (kotlin-mode . chief/kotlin-mode-setup))
-
-(chief/safe-use-package dart-mode
-  :mode ("\\.dart\\'" . dart-mode)
-  :hook (dart-mode . chief/dart-mode-setup))
 
 (chief/safe-use-package cue-mode
   :mode ("\\.cue\\'" . cue-mode))
@@ -649,9 +561,6 @@
 (add-to-list 'auto-mode-alist '("\\.🔥\\'" . python-ts-mode))
 
 (add-hook 'ruby-mode-hook #'chief/ruby-mode-setup)
-(add-hook 'java-mode-hook #'chief/java-mode-setup)
-(when (fboundp 'java-ts-mode)
-  (add-hook 'java-ts-mode-hook #'chief/java-mode-setup))
 (when (fboundp 'rust-ts-mode)
   (add-hook 'rust-ts-mode-hook #'chief/rust-mode-setup))
 (when (fboundp 'csharp-ts-mode)
@@ -659,15 +568,6 @@
 
 (with-eval-after-load 'lua-mode
   (chief/repl-setup-standard-local-leader 'lua-mode-map))
-
-(with-eval-after-load 'kotlin-mode
-  (chief/repl-setup-standard-local-leader 'kotlin-mode-map)
-  (chief/local-leader-def
-    :keymaps 'kotlin-mode-map
-    "c" '(:ignore t :which-key "compile")
-    "cb" #'chief/kotlin-build-project
-    "ct" #'chief/kotlin-test-project
-    "cr" #'chief/kotlin-run-project))
 
 (with-eval-after-load 'swift-mode
   (chief/repl-setup-standard-local-leader 'swift-mode-map)

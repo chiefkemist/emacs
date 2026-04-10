@@ -196,6 +196,7 @@
 (use-package rainbow-delimiters
   :hook ((emacs-lisp-mode . rainbow-delimiters-mode)
          (clojure-mode . rainbow-delimiters-mode)
+         (clojuredart-mode . rainbow-delimiters-mode)
          (clojurescript-mode . rainbow-delimiters-mode)
          (clojurec-mode . rainbow-delimiters-mode)
          (cider-repl-mode . rainbow-delimiters-mode)

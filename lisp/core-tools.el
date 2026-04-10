@@ -1,6 +1,11 @@
 ;;; core-tools.el --- Daily tooling -*- lexical-binding: t; -*-
 
 (declare-function chief/large-buffer-p "core-ui" (&optional threshold))
+(autoload 'agent-shell-openai-start-codex "agent-shell-openai" nil t)
+(autoload 'agent-shell-google-start-gemini "agent-shell-google" nil t)
+(autoload 'agent-shell-cursor-start-agent "agent-shell-cursor" nil t)
+(autoload 'agent-shell-pi-start-agent "agent-shell-pi" nil t)
+(autoload 'agent-shell-opencode-start-agent "agent-shell-opencode" nil t)
 
 (use-package envrc
   :defer 1
@@ -53,7 +58,7 @@
           ("BUG" . "#ff5555"))))
 
 (use-package agent-shell
-  :commands (agent-shell agent-shell-openai-start-codex)
+  :commands (agent-shell)
   :config
   (when (require 'agent-shell-openai nil t)
     (when (fboundp 'agent-shell-openai-make-codex-config)
@@ -62,7 +67,11 @@
   (chief/leader-def
     "a" '(:ignore t :which-key "agent")
     "aa" #'agent-shell
-    "ac" #'agent-shell-openai-start-codex))
+    "ac" #'agent-shell-openai-start-codex
+    "ag" #'agent-shell-google-start-gemini
+    "ao" #'agent-shell-opencode-start-agent
+    "ar" #'agent-shell-cursor-start-agent
+    "ap" #'agent-shell-pi-start-agent))
 
 (provide 'core-tools)
 ;;; core-tools.el ends here

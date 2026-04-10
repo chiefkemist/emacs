@@ -1,6 +1,7 @@
 ;;; core-completion.el --- Minibuffer and in-buffer completion -*- lexical-binding: t; -*-
 
 (require 'project)
+(declare-function chief/token-at-point "core-lsp")
 
 (setq tab-always-indent 'complete)
 (setq completion-cycle-threshold 3)
@@ -21,7 +22,9 @@
 (defun chief/consult-project-symbol-at-point ()
   "Search the project for the symbol at point."
   (interactive)
-  (consult-ripgrep nil (thing-at-point 'symbol t)))
+  (consult-ripgrep nil (or (and (fboundp 'chief/token-at-point)
+                                (chief/token-at-point))
+                           (thing-at-point 'symbol t))))
 
 (defun chief/consult-diagnostics ()
   "Show diagnostics using Consult when available."

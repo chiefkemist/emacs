@@ -2,6 +2,7 @@
 
 (chief/safe-use-package paredit
   :hook ((clojure-mode . paredit-mode)
+         (clojuredart-mode . paredit-mode)
          (clojurescript-mode . paredit-mode)
          (clojurec-mode . paredit-mode)
          (emacs-lisp-mode . paredit-mode)

@@ -5,9 +5,13 @@
 (setq inhibit-startup-screen t)
 (setq inhibit-startup-echo-area-message user-login-name)
 (setq frame-inhibit-implied-resize t)
+(defvar warning-suppress-types nil)
+(defvar warning-suppress-log-types nil)
 (setq native-comp-async-report-warnings-errors 'silent)
 (setq native-comp-jit-compilation-deny-list
       '("/general\\.el\\'"))
+(add-to-list 'warning-suppress-types '(files missing-lexbind-cookie))
+(add-to-list 'warning-suppress-log-types '(files missing-lexbind-cookie))
 
 (setq gc-cons-threshold most-positive-fixnum)
 (setq gc-cons-percentage 0.6)

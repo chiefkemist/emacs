@@ -14,7 +14,15 @@
 
 (add-to-list 'load-path chief/lisp-directory)
 
+(defvar warning-suppress-types nil)
+(defvar warning-suppress-log-types nil)
+(add-to-list 'warning-suppress-types '(files missing-lexbind-cookie))
+(add-to-list 'warning-suppress-log-types '(files missing-lexbind-cookie))
+
 (setq custom-file (expand-file-name "custom.el" chief/etc-directory))
+
+(defvar chief/reloading-config nil
+  "Non-nil while `chief/reload-config' is reloading config modules.")
 
 (setq chief/config-modules
       '(core-bootstrap
@@ -33,12 +41,16 @@
         core-treesit
         core-lsp
         core-dap
+        lang-dart
+        lang-cljd
         lang-clojure
         lang-common-lisp
         lang-elixir
         lang-erlang
         lang-go
         lang-jsts
+        lang-java
+        lang-kotlin
         lang-nushell
         lang-python
         lang-polyglot
@@ -46,19 +58,35 @@
         lang-zig
         core-org-babel))
 
+(defun chief/module-file (feature)
+  "Return the absolute source file path for FEATURE."
+  (expand-file-name (format "%s.el" (symbol-name feature)) chief/lisp-directory))
+
 (defun chief/load-config-modules ()
   "Load the configured Emacs modules in startup order.
 When `chief/reloading-config' is non-nil, reload modules from disk."
   (dolist (feature chief/config-modules)
-    (if (bound-and-true-p chief/reloading-config)
-        (load (symbol-name feature) nil 'nomessage)
+    (if chief/reloading-config
+        (load-file (chief/module-file feature))
       (require feature))))
+
+(defun chief/refresh-open-file-buffers ()
+  "Reinitialize existing file-visiting buffers after a config reload."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (and buffer-file-name
+                 (file-exists-p buffer-file-name)
+                 (not (minibufferp buffer)))
+        (let ((inhibit-message t)
+              (delayed-mode-hooks nil))
+          (normal-mode t))))))
 
 (defun chief/reload-config ()
   "Reload this Emacs configuration without restarting Emacs."
   (interactive)
   (let ((chief/reloading-config t)
         (gc-cons-threshold most-positive-fixnum)
+        (load-prefer-newer t)
         (init-file (or user-init-file
                        (expand-file-name "init.el" user-emacs-directory)))
         (file-name-handler-alist
@@ -66,6 +94,7 @@ When `chief/reloading-config' is non-nil, reload modules from disk."
              chief/file-name-handler-alist
            file-name-handler-alist)))
     (load-file init-file)
+    (chief/refresh-open-file-buffers)
     (when (fboundp 'chief/apply-fonts)
       (chief/apply-fonts))
     (message "Reloaded Emacs config from %s" user-emacs-directory)))

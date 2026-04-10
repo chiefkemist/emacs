@@ -10,7 +10,6 @@
   :type 'string
   :group 'chief)
 
-(define-derived-mode chief-clojuredart-mode clojure-mode "ClojureDart")
 (define-derived-mode chief-clojureclr-mode clojure-mode "ClojureCLR")
 (define-derived-mode chief-jank-mode clojure-mode "Jank")
 (define-derived-mode chief-joker-mode clojure-mode "Joker")
@@ -75,7 +74,6 @@
   :mode ("\\.cljc\\'" . clojure-mode)
   :mode ("\\.cljs\\'" . clojure-mode)
   :mode ("\\.edn\\'" . clojure-mode)
-  :mode ("\\.cljd\\'" . chief-clojuredart-mode)
   :mode ("\\.cljr\\'" . chief-clojureclr-mode)
   :mode ("\\.jank\\'" . chief-jank-mode)
   :mode ("\\.joke\\'" . chief-joker-mode)

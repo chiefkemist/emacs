@@ -1,5 +1,16 @@
 ;;; core-evil.el --- Modal editing -*- lexical-binding: t; -*-
 
+(require 'newcomment)
+
+(defun chief/evil-comment-dwim ()
+  "Comment or uncomment the active region, or the current line."
+  (interactive)
+  (comment-normalize-vars)
+  (if (use-region-p)
+      (comment-or-uncomment-region (region-beginning) (region-end))
+    (comment-or-uncomment-region (line-beginning-position)
+                                 (line-end-position))))
+
 (use-package general
   :demand t
   :config
@@ -31,6 +42,12 @@
    "C-j" #'windmove-down
    "C-k" #'windmove-up
    "C-l" #'windmove-right)
+  (general-define-key
+   :states '(visual)
+   "gc" #'chief/evil-comment-dwim)
+  (general-define-key
+   :states '(normal)
+   "gcc" #'chief/evil-comment-dwim)
   (general-define-key
    :keymaps 'override
    "<escape>" #'keyboard-escape-quit)

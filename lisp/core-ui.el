@@ -38,6 +38,9 @@
 (setq auto-revert-avoid-polling t)
 (setq auto-revert-use-notify t)
 (setq auto-revert-verbose nil)
+(setq select-enable-clipboard t)
+(setq select-enable-primary t)
+(setq save-interprogram-paste-before-kill t)
 (setq jit-lock-defer-time 0)
 (setq jit-lock-stealth-time 1.25)
 (setq jit-lock-stealth-nice 0.5)
@@ -69,6 +72,7 @@
 (blink-cursor-mode -1)
 (global-so-long-mode 1)
 (global-auto-revert-mode 1)
+(global-font-lock-mode 1)
 (save-place-mode 1)
 (savehist-mode 1)
 (recentf-mode 1)
@@ -94,9 +98,6 @@
 
 (dolist (hook '(term-mode-hook
                 shell-mode-hook
-                eshell-mode-hook
-                eat-mode-hook
-                vterm-mode-hook
                 org-mode-hook))
   (add-hook hook (lambda () (display-line-numbers-mode -1))))
 

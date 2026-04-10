@@ -6,7 +6,10 @@
 (require 'subr-x)
 
 (defcustom chief/project-root-markers
-  '("pyproject.toml"
+  '("deps.edn"
+    "bb.edn"
+    "nbb.edn"
+    "pyproject.toml"
     "uv.lock"
     "setup.py"
     "setup.cfg"

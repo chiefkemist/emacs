@@ -1,12 +1,6 @@
 ;;; core-terminal.el --- Terminal-specific behavior -*- lexical-binding: t; -*-
 
-(require 'project)
 (require 'subr-x)
-
-(defcustom chief/floating-terminal-height 0.32
-  "Height of the popup terminal window."
-  :type 'float
-  :group 'chief)
 
 (defun chief/terminal-frame-p (&optional frame)
   "Return non-nil when FRAME is a terminal frame."
@@ -74,65 +68,14 @@
         (setq interprogram-cut-function #'chief/tty-copy-to-clipboard
               interprogram-paste-function #'chief/tty-paste-from-clipboard)))))
 
-(defun chief/floating-terminal-buffer-name ()
-  "Return the project-aware Eat buffer name for the current context."
-  (if-let* ((project (project-current nil)))
-      (project-prefixed-buffer-name "eat")
-    (if (boundp 'eat-buffer-name)
-        eat-buffer-name
-      "*eat*")))
-
-(defun chief/floating-terminal-window ()
-  "Return the live window showing the current popup terminal, if any."
-  (when-let* ((buffer (get-buffer (chief/floating-terminal-buffer-name))))
-    (get-buffer-window buffer t)))
-
-(defun chief/floating-terminal-display (buffer _alist)
-  "Display BUFFER in a reusable popup terminal window."
-  (display-buffer-in-side-window
-   buffer
-   `((side . bottom)
-     (slot . -1)
-     (window-height . ,chief/floating-terminal-height)
-     (preserve-size . (t . t))
-     (window-parameters . ((no-delete-other-windows . t)
-                           (no-other-window . t))))))
-
-(defun chief/toggle-floating-terminal (&optional arg)
-  "Toggle a project-aware popup terminal.
-With prefix ARG, create or switch to a numbered Eat session."
-  (interactive "P")
-  (require 'eat)
-  (if-let* ((window (chief/floating-terminal-window)))
-      (delete-window window)
-    (let ((display-buffer-overriding-action
-           (cons #'chief/floating-terminal-display nil)))
-      (if (project-current nil)
-          (eat-project arg)
-        (eat nil arg)))))
-
-(defun chief/open-floating-terminal-here (&optional arg)
-  "Open a popup Eat terminal rooted at the current directory."
-  (interactive "P")
-  (require 'eat)
-  (let ((display-buffer-overriding-action
-         (cons #'chief/floating-terminal-display nil)))
-    (eat nil arg)))
-
 (add-hook 'tty-setup-hook #'chief/terminal-setup)
 (add-hook 'after-make-frame-functions #'chief/terminal-setup)
 
-(use-package eat
-  :commands (eat eat-project)
-  :hook (eat-mode . (lambda ()
-                      (setq-local mode-line-format nil)
-                      (setq-local truncate-lines t)
-                      (display-line-numbers-mode -1)))
-  :config
-  (setq eat-kill-buffer-on-exit nil)
-  (chief/leader-def
-    "'" #'chief/toggle-floating-terminal
-    "ot" #'chief/open-floating-terminal-here))
+(use-package ghostel
+  :straight (ghostel
+             :type git
+             :host github
+             :repo "dakra/ghostel"))
 
 (provide 'core-terminal)
 ;;; core-terminal.el ends here

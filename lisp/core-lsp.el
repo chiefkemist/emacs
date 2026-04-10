@@ -26,10 +26,15 @@ masquerade as the primary language server for a buffer.")
 
 (defconst chief/lsp-managed-major-modes
   '(bash-ts-mode
+    c-mode
     c-ts-mode
+    c++-mode
     c++-ts-mode
     clojure-mode
+    clojuredart-mode
+    css-mode
     csharp-ts-mode
+    csharp-mode
     css-ts-mode
     cue-mode
     dart-mode
@@ -40,16 +45,21 @@ masquerade as the primary language server for a buffer.")
     fennel-mode
     fsharp-mode
     gfm-mode
+    go-mode
     go-ts-mode
     haskell-mode
+    html-ts-mode
     hy-mode
+    java-mode
     java-ts-mode
+    js-json-mode
     js-ts-mode
     json-ts-mode
     kotlin-mode
     lua-mode
     lua-ts-mode
     markdown-mode
+    mhtml-mode
     nix-mode
     nim-mode
     nushell-mode
@@ -57,8 +67,11 @@ masquerade as the primary language server for a buffer.")
     protobuf-mode
     racket-mode
     reason-mode
+    ruby-mode
     ruby-ts-mode
+    rust-mode
     rust-ts-mode
+    sh-mode
     swift-mode
     tuareg-mode
     typescript-ts-mode
@@ -90,6 +103,10 @@ masquerade as the primary language server for a buffer.")
      :label "Dart"
      :doc-url "https://dart.dev/get-dart"
      :help "Install the Dart SDK or Flutter so `dart language-server --protocol=lsp` is available.")
+    (:modes (java-mode java-ts-mode)
+     :label "Java"
+     :doc-url "https://emacs-lsp.github.io/lsp-java/"
+     :help "Install JDT LS and configure a valid JDK 17+ so `jdtls` can start cleanly.")
     (:modes (tuareg-mode reason-mode caml-mode)
      :label "OCaml"
      :install-command ("opam" "install" "ocaml-lsp-server")
@@ -258,12 +275,35 @@ masquerade as the primary language server for a buffer.")
       (cl-pushnew canonical (lsp-session-folders session) :test #'equal)
       canonical)))
 
+(defun chief/lsp-preferred-session-folder (file-name)
+  "Return the preferred session folder for FILE-NAME in the current buffer.
+
+This only overrides `lsp-mode' session lookup when the current buffer has an
+explicit `chief/lsp-root-function' and FILE-NAME belongs to this buffer.  It
+prevents stale SDK/library session folders from winning over the project root."
+  (when (and chief/lsp-root-function
+             buffer-file-name
+             file-name
+             (stringp file-name)
+             (string-equal (file-truename file-name)
+                           (file-truename buffer-file-name)))
+    (when-let* ((root (chief/lsp-project-root))
+                ((stringp root))
+                ((file-directory-p root)))
+      (file-name-as-directory (lsp-f-canonical root)))))
+
+(defun chief/lsp-find-session-folder-a (orig-fn session file-name)
+  "Prefer the buffer's explicit project root over stale SESSION folders."
+  (or (chief/lsp-preferred-session-folder file-name)
+      (funcall orig-fn session file-name)))
+
 (defun chief/lsp-suggest-project-root-a (orig-fn &rest args)
   "Prefer `chief/lsp-project-root' over `lsp-mode' root guessing."
   (or (chief/lsp-project-root)
       (apply orig-fn args)))
 
 (advice-add 'lsp--suggest-project-root :around #'chief/lsp-suggest-project-root-a)
+(advice-add 'lsp-find-session-folder :around #'chief/lsp-find-session-folder-a)
 
 (defvar-local chief/lsp-definition-function nil
   "Buffer-local override used by `chief/goto-definition'.")
@@ -283,6 +323,57 @@ masquerade as the primary language server for a buffer.")
 (defvar-local chief/lsp-signature-function nil
   "Buffer-local override used by `chief/show-signature-help'.")
 
+(defvar-local chief/token-bounds-function nil
+  "Optional buffer-local override used by `chief/token-bounds-at-point'.")
+
+(defun chief/token-mode-override (slot &optional mode)
+  "Return the mode-level override stored in SLOT for MODE or its parents."
+  (let ((mode (or mode major-mode)))
+    (when mode
+      (or (get mode slot)
+          (when-let* ((parent (get mode 'derived-mode-parent)))
+            (chief/token-mode-override slot parent))))))
+
+(defun chief/default-identifier-bounds-at-point ()
+  "Return bounds of the identifier at point for identifier-style languages.
+
+Some major modes treat generic delimiters as part of the symbol syntax.  This
+helper ignores leaked delimiters such as `<`, `>`, `[`, `]`, `,`, and `?` by
+scanning the identifier bounds directly instead of trusting `thing-at-point'."
+  (save-excursion
+    (let ((on-ident
+           (lambda (ch)
+             (and ch
+                  (string-match-p "[[:alnum:]_]" (string ch))))))
+      (cond
+       ((funcall on-ident (char-after)))
+       ((funcall on-ident (char-before))
+        (backward-char))
+       (t
+        (setq on-ident nil)))
+      (when on-ident
+        (skip-chars-backward "[:alnum:]_")
+        (when (looking-at "[[:alpha:]_][[:alnum:]_]*")
+          (let ((start (point)))
+            (skip-chars-forward "[:alnum:]_")
+            (cons start (point))))))))
+
+(defun chief/token-bounds-at-point ()
+  "Return bounds of the token at point using the shared token pipeline."
+  (if-let* ((override (or chief/token-bounds-function
+                          (chief/token-mode-override 'chief/token-bounds-function))))
+      (funcall override)
+    (chief/default-identifier-bounds-at-point)))
+
+(defun chief/token-at-point ()
+  "Return the shared token at point as a string."
+  (when-let* ((bounds (chief/token-bounds-at-point)))
+    (buffer-substring-no-properties (car bounds) (cdr bounds))))
+
+(defun chief/lsp-symbol-at-point ()
+  "Return the shared token at point for LSP/UI paths."
+  (chief/token-at-point))
+
 (defun chief/lsp-request-error-message (err)
   "Return a readable error message for async LSP ERR."
   (cond
@@ -301,6 +392,14 @@ masquerade as the primary language server for a buffer.")
             (and (symbolp fn) (fboundp fn)))
     (call-interactively fn)
     t))
+
+(defun chief/lsp-mode-override (slot &optional mode)
+  "Return the mode-level override stored in SLOT for MODE or its parents."
+  (let ((mode (or mode major-mode)))
+    (when mode
+      (or (get mode slot)
+          (when-let* ((parent (get mode 'derived-mode-parent)))
+            (chief/lsp-mode-override slot parent))))))
 
 (defun chief/lsp-executable-command (name &rest args)
   "Return an executable command list for NAME and ARGS when available."
@@ -389,7 +488,7 @@ default echo-area text when no locations are returned."
     (user-error "No LSP location backend is available here"))
   (let ((buffer (current-buffer))
         (params (append (lsp--text-document-position-params) extra))
-        (symbol (thing-at-point 'symbol t)))
+        (symbol (chief/lsp-symbol-at-point)))
     (lsp-request-async
      method
      params
@@ -494,6 +593,8 @@ match `lsp-show-xrefs'."
   (interactive)
   (cond
    ((chief/lsp-call-local-override chief/lsp-definition-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-definition-function)))
    ((chief/lsp-ensure-active-for-navigation)
     (chief/lsp-goto-definition-direct))
    (t
@@ -504,6 +605,8 @@ match `lsp-show-xrefs'."
   (interactive)
   (cond
    ((chief/lsp-call-local-override chief/lsp-declaration-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-declaration-function)))
    ((chief/lsp-ensure-active-for-navigation)
     (chief/lsp-goto-declaration-direct))
    (t
@@ -514,6 +617,8 @@ match `lsp-show-xrefs'."
   (interactive)
   (cond
    ((chief/lsp-call-local-override chief/lsp-references-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-references-function)))
    ((chief/lsp-ensure-active-for-navigation)
     (chief/find-references))
    (t
@@ -524,6 +629,8 @@ match `lsp-show-xrefs'."
   (interactive)
   (cond
    ((chief/lsp-call-local-override chief/lsp-implementation-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-implementation-function)))
    ((chief/lsp-ensure-active-for-navigation)
     (chief/lsp-goto-implementation-direct))
    (t
@@ -534,6 +641,8 @@ match `lsp-show-xrefs'."
   (interactive)
   (cond
    ((chief/lsp-call-local-override chief/lsp-hover-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-hover-function)))
    ((and (chief/lsp-ensure-active-for-navigation)
          (fboundp 'lsp-request-async)
          (fboundp 'lsp--display-contents))
@@ -562,27 +671,94 @@ match `lsp-show-xrefs'."
   (interactive)
   (cond
    ((chief/lsp-call-local-override chief/lsp-signature-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-signature-function)))
    ((and (chief/lsp-ensure-active-for-navigation)
          (fboundp 'lsp-signature-activate))
     (call-interactively #'lsp-signature-activate))
    (t
     (user-error "No signature help backend is available here"))))
 
+(defun chief/lsp-current-workspaces ()
+  "Return the live workspaces relevant to the current buffer."
+  (or (and (boundp 'lsp--buffer-workspaces)
+           lsp--buffer-workspaces)
+      (and (fboundp 'lsp-workspaces)
+           (lsp-workspaces))
+      nil))
+
+(defun chief/lsp-capability-present-p (capability &optional method)
+  "Return non-nil when CAPABILITY or METHOD is supported in this buffer.
+
+CAPABILITY is a raw server-capability key like \"inlayHintProvider\".
+METHOD is the corresponding LSP method like \"textDocument/inlayHint\"."
+  (or
+   (cl-some
+    (lambda (workspace)
+      (let ((caps (and workspace (lsp--workspace-server-capabilities workspace))))
+        (cond
+         ((hash-table-p caps)
+          (or (gethash capability caps)
+              (gethash (intern capability) caps)))
+         ((listp caps)
+          (or (plist-get caps (intern (concat ":" capability)))
+              (plist-get caps capability)))
+         (t nil))))
+    (chief/lsp-current-workspaces))
+   (and method
+        (fboundp 'lsp-feature?)
+        (lsp-feature? method))))
+
+(defun chief/lsp-completion-allowed-p ()
+  "Return non-nil when LSP completion should be enabled for this buffer."
+  (chief/lsp-capability-present-p "completionProvider" "textDocument/completion"))
+
+(defun chief/lsp-signature-help-allowed-p ()
+  "Return non-nil when LSP signature help should be enabled for this buffer."
+  (chief/lsp-capability-present-p "signatureHelpProvider" "textDocument/signatureHelp"))
+
+(defun chief/lsp-inlay-hints-allowed-p ()
+  "Return non-nil when inlay hints should be enabled for the current buffer."
+  (and (not (derived-mode-p 'text-mode))
+       (chief/lsp-capability-present-p "inlayHintProvider" "textDocument/inlayHint")))
+
+(defun chief/lsp-sanitize-inlay-hints ()
+  "Keep inlay hints aligned with the current buffer and server capabilities."
+  (let ((enabled (chief/lsp-inlay-hints-allowed-p)))
+    (setq-local lsp-inlay-hint-enable enabled)
+    (when (fboundp 'lsp-inlay-hints-mode)
+      (lsp-inlay-hints-mode (if enabled 1 -1)))))
+
+(defun chief/lsp-update-inlay-hints-a (orig-fn start end)
+  "Only run ORIG-FN for inlay hints when the current buffer supports them."
+  (if (chief/lsp-inlay-hints-allowed-p)
+      (funcall orig-fn start end)
+    (when (fboundp 'lsp-inlay-hints-mode)
+      (lsp-inlay-hints-mode -1))
+    nil))
+
+(advice-add 'lsp-update-inlay-hints :around #'chief/lsp-update-inlay-hints-a)
+
 (defun chief/lsp-ui-buffer-setup ()
   "Enable lightweight LSP UI features for the current buffer."
-  (let ((lightweight-p
-         (not (and (fboundp 'chief/large-buffer-p)
-                   (chief/large-buffer-p)))))
+  (let* ((lightweight-p
+          (not (and (fboundp 'chief/large-buffer-p)
+                    (chief/large-buffer-p))))
+         (inlay-hints-p (and lightweight-p
+                             (chief/lsp-inlay-hints-allowed-p))))
     (setq-local lsp-enable-symbol-highlighting lightweight-p)
-    (setq-local lsp-inlay-hint-enable lightweight-p))
-  (eldoc-mode 1)
-  (when (and (bound-and-true-p lsp-inlay-hint-enable)
-             (fboundp 'lsp-inlay-hints-mode))
-    (lsp-inlay-hints-mode 1))
-  (when (fboundp 'chief/format-enable-on-save)
-    (chief/format-enable-on-save))
-  (when (fboundp 'yas-minor-mode)
-    (yas-minor-mode 1)))
+    (setq-local lsp-inlay-hint-enable inlay-hints-p)
+    (eldoc-mode 1)
+    (when (fboundp 'lsp-completion-mode)
+      (lsp-completion-mode 1))
+    (when (fboundp 'lsp-signature-mode)
+      (lsp-signature-mode (if (derived-mode-p 'text-mode) -1 1)))
+    (when (fboundp 'lsp-inlay-hints-mode)
+      (lsp-inlay-hints-mode (if (bound-and-true-p lsp-inlay-hint-enable) 1 -1)))
+    (when (fboundp 'chief/format-enable-on-save)
+      (chief/format-enable-on-save))
+    (when (fboundp 'yas-minor-mode)
+      (yas-minor-mode 1))))
 
 (with-eval-after-load 'evil
   (dolist (state '(normal motion visual))
@@ -626,9 +802,69 @@ match `lsp-show-xrefs'."
   "Return the command list for the Kotlin LSP used in the NeoVim setup."
   (chief/lsp-probed-executable-command "kotlin-lsp" '("--stdio") '("--help")))
 
+(defun chief/lsp-find-kotlin-workspace ()
+  "Return the active Kotlin workspace for the current session.
+
+Prefer the custom `kotlin-lsp-custom' workspace, but fall back to the
+built-in `kotlin-ls' client when needed."
+  (or (cl-find-if
+       (lambda (workspace)
+         (memq (lsp--client-server-id (lsp--workspace-client workspace))
+               '(kotlin-lsp-custom kotlin-ls)))
+       (lsp-workspaces))
+      (lsp-find-workspace 'kotlin-lsp-custom nil)
+      (lsp-find-workspace 'kotlin-ls nil)))
+
+(defun chief/lsp-kotlin-uri-handler (uri)
+  "Load a Kotlin external-source URI using the active Kotlin workspace."
+  (let ((file-location (lsp-kotlin--parse-uri uri)))
+    (unless (file-readable-p file-location)
+      (lsp-kotlin--ensure-dir (file-name-directory file-location))
+      (if-let* ((workspace (chief/lsp-find-kotlin-workspace)))
+          (with-lsp-workspace workspace
+            (let ((content (lsp-send-request
+                            (lsp-make-request "kotlin/jarClassContents"
+                                              (list :uri uri)))))
+              (with-temp-file file-location
+                (insert content))))
+        (user-error "No active Kotlin workspace is available for %s" uri)))
+    file-location))
+
+(defun chief/lsp-dart-sdk-executable ()
+  "Return the preferred real Dart SDK executable path."
+  (when-let* ((dart (executable-find "dart")))
+    (let* ((resolved (file-truename dart))
+           (flutter-sdk-dart
+            (when (string-match-p "/flutter/bin/dart\\'" resolved)
+              (expand-file-name "cache/dart-sdk/bin/dart"
+                                (file-name-directory resolved)))))
+      (cond
+       ((and flutter-sdk-dart
+             (file-executable-p flutter-sdk-dart))
+        flutter-sdk-dart)
+       ((file-executable-p resolved)
+        resolved)
+       ((file-executable-p dart)
+        dart)
+       (t nil)))))
+
+(defun chief/lsp-dart-sdk-dir ()
+  "Return the preferred Dart SDK directory."
+  (when-let* ((dart (chief/lsp-dart-sdk-executable)))
+    (directory-file-name
+     (expand-file-name ".." (file-name-directory dart)))))
+
+(defun chief/lsp-flutter-sdk-dir ()
+  "Return the Flutter SDK directory associated with the current Dart executable."
+  (when-let* ((dart (chief/lsp-dart-sdk-executable))
+              ((string-match "\\(.*?/flutter\\)/bin/cache/dart-sdk/bin/dart\\'" dart)))
+    (match-string 1 dart)))
+
 (defun chief/lsp-dart-command ()
   "Return the command list for the Dart language server."
-  (chief/lsp-probed-executable-command "dart" '("language-server" "--protocol=lsp") '("--version")))
+  (when-let* ((dart (chief/lsp-dart-sdk-executable))
+              ((chief/lsp-command-usable-p (list dart "language-server" "--help"))))
+    (list dart "language-server" "--protocol=lsp")))
 
 (defun chief/lsp-cue-command ()
   "Return the command list for the CUE language server."
@@ -776,13 +1012,16 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
 (use-package lsp-mode
   :commands (lsp lsp-deferred)
   :hook ((lsp-mode . lsp-enable-which-key-integration)
-         (lsp-completion-mode . chief/lsp-ui-buffer-setup)
+         (lsp-mode . chief/lsp-sanitize-inlay-hints)
+         (lsp-mode . chief/lsp-ui-buffer-setup)
+         (lsp-configure-hook . chief/lsp-ui-buffer-setup)
          (bash-ts-mode . chief/lsp-managed-mode-setup)
          (c-mode . chief/lsp-managed-mode-setup)
          (c-ts-mode . chief/lsp-managed-mode-setup)
          (c++-mode . chief/lsp-managed-mode-setup)
          (c++-ts-mode . chief/lsp-managed-mode-setup)
          (clojure-mode . chief/lsp-managed-mode-setup)
+         (clojuredart-mode . chief/lsp-managed-mode-setup)
          (css-mode . chief/lsp-managed-mode-setup)
          (css-ts-mode . chief/lsp-managed-mode-setup)
          (csharp-mode . chief/lsp-managed-mode-setup)
@@ -854,6 +1093,7 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
   (require 'lsp-clojure)
   (require 'lsp-clangd)
   (require 'lsp-css)
+  (require 'lsp-dart nil t)
   (require 'lsp-elixir)
   (require 'lsp-erlang)
   (require 'lsp-fennel)
@@ -903,6 +1143,8 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
   (setq lsp-completion-show-kind t)
   (setq lsp-completion-show-detail t)
   (setq lsp-clojure-server-command '("clojure-lsp"))
+  (add-to-list 'lsp-language-id-configuration '(clojuredart-mode . "clojure"))
+  (add-to-list 'lsp-language-id-configuration '("\\.cljd\\'" . "clojure"))
   (setq lsp-go-directory-filters
         ["-.git"
          "-.direnv"
@@ -938,10 +1180,25 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
     (setq lsp-rust-analyzer-server-command nil))
   (when-let* ((command (chief/lsp-probed-executable-command "nu" '("--lsp") '("--version"))))
     (setq lsp-nushell-language-server-command command))
+  (with-eval-after-load 'lsp-clojure
+    (when-let* ((client (gethash 'clojure-lsp lsp-clients)))
+      (setf (lsp--client-major-modes client)
+            (cl-remove-duplicates
+             (append '(clojuredart-mode)
+                     (lsp--client-major-modes client))
+             :test #'eq))))
   (lsp-register-client
    (make-lsp-client
     :new-connection (lsp-stdio-connection #'chief/lsp-kotlin-command)
     :major-modes '(kotlin-mode)
+    :uri-handlers (lsp-ht ("kls" #'chief/lsp-kotlin-uri-handler))
+    :initialized-fn (lambda (workspace)
+                      (with-lsp-workspace workspace
+                        (lsp--set-configuration (lsp-configuration-section "kotlin"))))
+    :initialization-options (lambda ()
+                              (when lsp-kotlin-ondisk-cache-enabled
+                                (list :storagePath (or lsp-kotlin-ondisk-cache-path
+                                                       (lsp-workspace-root)))))
     :priority 2
     :server-id 'kotlin-lsp-custom))
   (lsp-register-client
@@ -950,12 +1207,6 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
     :major-modes '(swift-mode)
     :priority 1
     :server-id 'sourcekit-lsp))
-  (lsp-register-client
-   (make-lsp-client
-    :new-connection (lsp-stdio-connection #'chief/lsp-dart-command)
-    :major-modes '(dart-mode)
-    :priority 1
-    :server-id 'dart-lsp))
   (lsp-register-client
    (make-lsp-client
     :new-connection (lsp-stdio-connection #'chief/lsp-cue-command)
@@ -978,6 +1229,23 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
     "ls" #'consult-lsp-symbols
     "le" #'flycheck-list-errors)
   )
+
+(chief/safe-use-package lsp-dart
+  :after lsp-mode
+  :demand t
+  :config
+  (when-let* ((dart (chief/lsp-dart-sdk-executable)))
+    (setq lsp-dart-server-command
+          (append
+           (list dart "--suppress-analytics" "language-server" "--client-id=emacs.lsp-dart")
+           (when (boundp 'lsp-dart-version-string)
+             (list (format "--client-version=%s" lsp-dart-version-string))))))
+  (when-let* ((sdk-dir (chief/lsp-dart-sdk-dir)))
+    (setq lsp-dart-sdk-dir sdk-dir))
+  (when-let* ((flutter-dir (chief/lsp-flutter-sdk-dir)))
+    (setq lsp-dart-flutter-sdk-dir flutter-dir))
+  (setq lsp-dart-only-analyze-projects-with-open-files t)
+  (setq lsp-dart-show-todos t))
 
 (provide 'core-lsp)
 ;;; core-lsp.el ends here
