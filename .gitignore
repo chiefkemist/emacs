@@ -2,6 +2,7 @@
 .DS_Store
 
 /.cache/
+/.local/
 /.dap-breakpoints
 /.lsp-session-v1
 /agent/

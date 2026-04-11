@@ -6,8 +6,8 @@
 (require 'core-projects)
 (require 'core-repl)
 (require 'core-lsp)
-(require 'json)
 (require 'inf-lisp)
+(require 'json)
 (require 'seq)
 (require 'subr-x)
 (require 'url-parse)
@@ -24,11 +24,6 @@
   :type 'string
   :group 'chief)
 
-(defcustom chief/cljd-netcat-command "nc"
-  "Command used to connect to the ClojureDart socket REPL."
-  :type 'string
-  :group 'chief)
-
 (defcustom chief/cljd-preferred-flutter-device nil
   "Preferred Flutter device id for ClojureDart watcher startup."
   :type '(choice (const :tag "Auto" nil)
@@ -40,6 +35,21 @@
   :type 'integer
   :group 'chief)
 
+(defcustom chief/cljd-repl-prompt-timeout 10
+  "Seconds to wait for the initial ClojureDart REPL prompt after connecting."
+  :type 'integer
+  :group 'chief)
+
+(defcustom chief/cljd-repl-watch-ready-timeout 45
+  "Maximum seconds to wait for a Flutter watcher to become REPL-ready."
+  :type 'integer
+  :group 'chief)
+
+(defcustom chief/cljd-repl-watch-settle-delay 30.0
+  "Fallback seconds to wait after the REPL port appears for Flutter startup to settle."
+  :type 'number
+  :group 'chief)
+
 (defcustom chief/cljd-dart-navigation-timeout 15.0
   "Seconds to wait asynchronously for hidden Dart analysis during CLJD navigation.
 This does not block the Emacs UI; it bounds how long the CLJD -> Dart bridge will
@@ -47,17 +57,43 @@ wait before failing or falling back to opening the library file."
   :type 'number
   :group 'chief)
 
+(defcustom chief/cljd-inline-result-duration 6.0
+  "Seconds to keep inline CLJD evaluation results visible in source buffers."
+  :type 'number
+  :group 'chief)
+
 (defconst chief/cljd-repl-port-regexp
   "ClojureDart REPL listening on port \\([0-9]+\\)"
   "Regexp used to detect the ClojureDart socket REPL port from watch output.")
 
+(defconst chief/cljd-watch-reloaded-regexp
+  "Reloaded .+ libraries in .+\\."
+  "Regexp used to detect that Flutter finished its initial hot reload.")
+
 (define-derived-mode clojuredart-mode clojure-mode "ClojureDart")
+
+(defun chief/cljd-repl-output-hook (_string)
+  "Resolve pending CLJD requests after REPL output arrives."
+  (when-let* ((process (get-buffer-process (current-buffer))))
+    (chief/cljd--drain-repl-requests process)))
 
 (define-derived-mode chief/cljd-repl-mode inferior-lisp-mode "CLJD-REPL"
   "Major mode for ClojureDart socket REPL buffers."
   (setq-local comint-prompt-regexp "^[[:alnum:]._/-]+=> ")
   (setq-local comint-use-prompt-regexp t)
-  (setq-local comint-process-echoes nil))
+  (setq-local comint-process-echoes nil)
+  (setq-local comint-prompt-read-only t)
+  (define-key chief/cljd-repl-mode-map (kbd "RET") #'chief/cljd-repl-return)
+  (define-key chief/cljd-repl-mode-map (kbd "<return>") #'chief/cljd-repl-return)
+  (define-key chief/cljd-repl-mode-map (kbd "C-m") #'chief/cljd-repl-return)
+  (define-key chief/cljd-repl-mode-map (kbd "C-j") #'chief/cljd-repl-return)
+  (when (fboundp 'evil-define-key)
+    (evil-define-key '(insert normal emacs) chief/cljd-repl-mode-map
+      (kbd "RET") #'chief/cljd-repl-return
+      (kbd "<return>") #'chief/cljd-repl-return
+      (kbd "C-m") #'chief/cljd-repl-return
+      (kbd "C-j") #'chief/cljd-repl-return))
+  (add-hook 'comint-output-filter-functions #'chief/cljd-repl-output-hook nil t))
 
 (defvar chief/cljd-last-flutter-device nil
   "Most recently used Flutter device id for ClojureDart watcher startup.")
@@ -73,11 +109,189 @@ wait before failing or falling back to opening the library file."
 (defvar chief/cljd-dart-nav-cache (make-hash-table :test #'equal)
   "Cache of resolved CLJD -> Dart definition locations.")
 
+(defvar chief/cljd--dart-nav-sessions (make-hash-table :test #'equal)
+  "Live CLJD -> Dart navigation helper sessions keyed by project root.")
+
+(defvar chief/cljd--dart-nav-next-request-id 0
+  "Monotonic id assigned to helper requests across all CLJD buffers.")
+
+(defvar chief/cljd--dart-nav-cleanup-installed nil
+  "Non-nil once CLJD Dart helper cleanup hooks were registered.")
+
 (defvar-local chief/cljd--dart-nav-request-token 0
   "Monotonic request token for CLJD -> Dart lookups in the current buffer.")
 
-(defvar-local chief/cljd--dart-nav-process nil
-  "Active asynchronous CLJD -> Dart lookup process for the current buffer.")
+(defvar-local chief/cljd--last-inline-result-overlay nil
+  "Most recent inline ClojureDart evaluation result overlay in the current buffer.")
+
+(defun chief/cljd--clear-inline-result-overlay (&optional overlay)
+  "Delete OVERLAY, defaulting to the current buffer's CLJD result overlay."
+  (let ((overlay (or overlay chief/cljd--last-inline-result-overlay)))
+    (when (overlayp overlay)
+      (delete-overlay overlay))
+    (when (eq overlay chief/cljd--last-inline-result-overlay)
+      (setq chief/cljd--last-inline-result-overlay nil))))
+
+(defun chief/cljd--format-inline-result (result)
+  "Return RESULT formatted for a one-line inline annotation."
+  (let* ((text (string-trim result))
+         (single-line (replace-regexp-in-string "[\r\n]+" " " text)))
+    (truncate-string-to-width single-line 120 nil nil " ...")))
+
+(defun chief/cljd--show-inline-result (marker result)
+  "Show inline RESULT at MARKER in its source buffer."
+  (when-let* ((buffer (marker-buffer marker))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (chief/cljd--clear-inline-result-overlay)
+      (let* ((pos (marker-position marker))
+             (overlay (make-overlay pos pos buffer)))
+        (overlay-put overlay 'after-string
+                     (propertize
+                      (format "  => %s" (chief/cljd--format-inline-result result))
+                      'face 'shadow))
+        (setq-local chief/cljd--last-inline-result-overlay overlay)
+        (run-at-time chief/cljd-inline-result-duration nil
+                     #'chief/cljd--clear-inline-result-overlay overlay)))))
+
+(defun chief/cljd--register-repl-request (process &optional result-marker &rest props)
+  "Register a pending CLJD REPL request on PROCESS.
+When RESULT-MARKER is non-nil, show the eventual result inline there.
+PROPS are additional plist entries stored alongside the request."
+  (when-let* ((buffer (process-buffer process))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (let* ((start (copy-marker (process-mark process)))
+             (queue (process-get process :chief/cljd-pending-requests))
+             (request (append (list :output-start start
+                                    :result-marker result-marker)
+                              props)))
+        (process-put process :chief/cljd-pending-requests
+                     (append queue (list request)))))))
+
+(defun chief/cljd--trim-repl-output (text &optional sent-text)
+  "Normalize CLJD REPL output TEXT for source-buffer display.
+When SENT-TEXT is non-nil, strip that echoed submission from the front."
+  (let* ((normalized (replace-regexp-in-string "\r" "" text))
+         (trimmed (string-trim normalized))
+         (sent (and sent-text
+                    (string-trim (replace-regexp-in-string "\r" "" sent-text)))))
+    (when (and sent (not (string-empty-p sent)))
+      (when (string-prefix-p sent trimmed)
+        (setq trimmed (string-trim (substring trimmed (length sent)))))
+      (when (string-prefix-p (concat sent "\n") normalized)
+        (setq trimmed (string-trim
+                       (substring normalized (length (concat sent "\n")))))))
+    (unless (string-empty-p trimmed)
+      trimmed)))
+
+(defun chief/cljd--drain-repl-requests (process)
+  "Resolve completed CLJD REPL requests for PROCESS."
+  (when-let* ((buffer (process-buffer process))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (let ((queue (process-get process :chief/cljd-pending-requests)))
+        (while queue
+          (let* ((request (car queue))
+                 (start-marker (plist-get request :output-start))
+                 (result-marker (plist-get request :result-marker)))
+            (if (not (marker-buffer start-marker))
+                (setq queue (cdr queue))
+              (save-excursion
+                (goto-char (marker-position start-marker))
+                (if-let* ((prompt-pos (re-search-forward comint-prompt-regexp nil t)))
+                    (let* ((start-pos (marker-position start-marker))
+                           (prompt-beg (match-beginning 0))
+                           (output (buffer-substring-no-properties
+                                    start-pos
+                                    prompt-beg))
+                           (result (chief/cljd--trim-repl-output
+                                    output
+                                    (plist-get request :sent-text)))
+                           (discard-output (plist-get request :discard-output)))
+                      (setq queue (cdr queue))
+                      (set-marker start-marker nil)
+                      (if discard-output
+                          (delete-region start-pos prompt-beg)
+                        (when (and result result-marker)
+                          (chief/cljd--show-inline-result result-marker result))))
+                  (setq queue :pending)))))
+          (process-put process :chief/cljd-pending-requests
+                       (if (eq queue :pending)
+                           (process-get process :chief/cljd-pending-requests)
+                         queue))
+          (when (eq queue :pending)
+            (setq queue nil)))))))
+
+(defun chief/cljd-repl-process-sentinel (process event)
+  "Report CLJD REPL PROCESS lifecycle EVENTs in the REPL buffer."
+  (when-let* ((buffer (process-buffer process))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (goto-char (point-max))
+        (insert (format "\n; CLJD REPL %s" (string-trim event)))
+        (set-marker (process-mark process) (point-max))))))
+
+(defun chief/cljd-repl-ready-p (&optional buffer)
+  "Return non-nil when BUFFER has shown a CLJD prompt."
+  (when-let* ((buffer (or buffer (chief/cljd-repl-buffer)))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char (point-min))
+        (re-search-forward comint-prompt-regexp nil t)))))
+
+(defun chief/cljd-wait-for-repl-prompt (process &optional timeout)
+  "Wait for PROCESS to show its initial CLJD prompt within TIMEOUT seconds."
+  (let* ((timeout (or timeout chief/cljd-repl-prompt-timeout))
+         (deadline (+ (float-time) timeout))
+         (buffer (process-buffer process)))
+    (while (and (process-live-p process)
+                (< (float-time) deadline)
+                (not (chief/cljd-repl-ready-p buffer)))
+      (accept-process-output process 0.25))
+    (chief/cljd-repl-ready-p buffer)))
+
+(defun chief/cljd--send-repl-input (process sent-text &optional result-marker already-in-buffer)
+  "Send SENT-TEXT to PROCESS and optionally associate RESULT-MARKER.
+When ALREADY-IN-BUFFER is non-nil, reuse the user's existing input text in the
+REPL buffer instead of inserting another copy."
+  (let* ((buffer (process-buffer process))
+         (text (string-trim-right (or sent-text "") "[\r\n]+")))
+    (with-current-buffer buffer
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (if already-in-buffer
+            (progn
+              (setq comint-last-input-start
+                    (copy-marker (marker-position (process-mark process))))
+              (insert "\n")
+              (setq comint-last-input-end (copy-marker (point-max) t)))
+          (insert text "\n"))
+        (set-marker (process-mark process) (point-max) buffer)))
+    (unless (string-empty-p text)
+      (with-current-buffer buffer
+        (comint-add-to-input-history text)))
+    (chief/cljd--register-repl-request process result-marker :sent-text text)
+    (process-send-string process (concat text "\n"))
+    process))
+
+(defun chief/cljd-repl-return ()
+  "Submit the current CLJD REPL input."
+  (interactive)
+  (goto-char (point-max))
+  (when-let* ((process (chief/cljd-repl-process)))
+    (let ((result-marker (process-get process :chief/cljd-next-result-marker))
+          (input-start (marker-position (process-mark process)))
+          (input-end (point-max)))
+      (process-put process :chief/cljd-next-result-marker nil)
+      (process-put process :chief/cljd-next-sent-text nil)
+      (chief/cljd--send-repl-input
+       process
+       (buffer-substring-no-properties input-start input-end)
+       result-marker
+       t))))
 
 (defun chief/cljd-project-root ()
   "Return the current ClojureDart project root."
@@ -309,54 +523,108 @@ wait before failing or falling back to opening the library file."
   "Return the cache key for URI, SYMBOL, and optional MEMBER."
   (list (chief/cljd-project-root) uri symbol member))
 
-(defun chief/cljd--dart-nav-helper-command (roots uri symbol &optional member file)
-  "Return the helper command used to resolve URI, SYMBOL, and MEMBER for ROOTS."
+(defun chief/cljd--dart-nav-session-key (&optional root)
+  "Return the session cache key for ROOT or the current CLJD project."
+  (expand-file-name (or root (chief/cljd-project-root))))
+
+(defun chief/cljd--dart-nav-helper-socket-path (key)
+  "Return the Unix socket path used by the persistent helper for KEY."
+  (let ((dir (expand-file-name "cljd-dart-nav" temporary-file-directory)))
+    (make-directory dir t)
+    (expand-file-name (format "%s.sock" (md5 key)) dir)))
+
+(defun chief/cljd--dart-nav-helper-start-command (key)
+  "Return the persistent helper command used for CLJD -> Dart lookups for KEY."
   (unless (file-readable-p chief/cljd-dart-nav-helper-script)
     (user-error "Missing CLJD Dart navigation helper: %s" chief/cljd-dart-nav-helper-script))
-  (append
-   (list (or (and invocation-directory
-                  (file-executable-p (expand-file-name invocation-name invocation-directory))
-                  (expand-file-name invocation-name invocation-directory))
-             invocation-name)
-         "--batch" "-Q" "-l" chief/cljd-dart-nav-helper-script "--"
-         "--timeout" (number-to-string chief/cljd-dart-navigation-timeout)
-         "--dart-executable" (or (chief/lsp-dart-sdk-executable)
-                                 (executable-find "dart")
-                                 "dart")
-         "--uri" uri
-         "--symbol" symbol)
-   (when file
-     (list "--file" file))
-   (when member
-     (list "--member" member))
-   (cl-mapcan (lambda (root)
-                (list "--root" root))
-              roots)))
+  (list (or (and invocation-directory
+                 (file-executable-p (expand-file-name invocation-name invocation-directory))
+                 (expand-file-name invocation-name invocation-directory))
+            invocation-name)
+        "--batch" "-Q" "-l" chief/cljd-dart-nav-helper-script "--"
+        "--server"
+        "--socket" (chief/cljd--dart-nav-helper-socket-path key)
+        "--timeout" (number-to-string chief/cljd-dart-navigation-timeout)
+        "--dart-executable" (or (chief/lsp-dart-sdk-executable)
+                                (executable-find "dart")
+                                "dart")))
 
-(defun chief/cljd--dart-nav-process-filter (process chunk)
-  "Accumulate PROCESS output CHUNK for the CLJD Dart navigation helper."
-  (process-put process :stdout
-               (concat (or (process-get process :stdout) "") chunk)))
+(defun chief/cljd--dart-nav-session-live-p (session)
+  "Return non-nil when SESSION still owns a live helper or connection."
+  (or (and (processp (plist-get session :connection))
+           (process-live-p (plist-get session :connection)))
+      (and (processp (plist-get session :helper))
+           (process-live-p (plist-get session :helper)))))
 
-(defun chief/cljd--dart-nav-parse-helper-output (stdout)
-  "Parse helper STDOUT, tolerating harmless preamble noise."
-  (let ((start 0)
-        payload)
-    (while (and (< start (length stdout)) (not payload))
-      (let ((json-start (string-match "{" stdout start)))
-        (if (null json-start)
-            (setq start (length stdout))
-          (setq payload
-                (condition-case nil
-                    (json-parse-string
-                     (substring stdout json-start)
-                     :object-type 'alist
-                     :array-type 'list
-                     :null-object nil
-                     :false-object nil)
-                  (error nil)))
-          (setq start (1+ json-start)))))
-    payload))
+(defun chief/cljd--dart-nav-session (key)
+  "Return the CLJD Dart helper session stored under KEY."
+  (gethash key chief/cljd--dart-nav-sessions))
+
+(defun chief/cljd--dart-nav-install-cleanup ()
+  "Install one-time cleanup hooks for persistent CLJD Dart helpers."
+  (unless chief/cljd--dart-nav-cleanup-installed
+    (add-hook 'kill-emacs-hook #'chief/cljd-shutdown-dart-navigation-helpers)
+    (setq chief/cljd--dart-nav-cleanup-installed t)))
+
+(defun chief/cljd--dart-nav-kill-session-processes (session)
+  "Terminate helper SESSION processes and temporary buffers."
+  (when-let* ((timer (plist-get session :connect-timer)))
+    (cancel-timer timer))
+  (when-let* ((connection (plist-get session :connection)))
+    (ignore-errors (delete-process connection)))
+  (when-let* ((helper (plist-get session :helper)))
+    (ignore-errors (kill-process helper)))
+  (when-let* ((socket-path (plist-get session :socket-path)))
+    (ignore-errors (delete-file socket-path)))
+  (when-let* ((stderr-buffer (plist-get session :stderr-buffer))
+              ((buffer-live-p stderr-buffer)))
+    (kill-buffer stderr-buffer)))
+
+(defun chief/cljd--dart-nav-fail-pending-requests (session reason)
+  "Fail all pending navigation requests in SESSION with REASON."
+  (let ((pending (plist-get session :pending)))
+    (when (hash-table-p pending)
+      (maphash
+       (lambda (_id metadata)
+         (when (eq (plist-get metadata :kind) 'resolve)
+           (let ((origin (plist-get metadata :origin-buffer))
+                 (token (plist-get metadata :token))
+                 (uri (plist-get metadata :uri))
+                 (target (plist-get metadata :target)))
+             (when (buffer-live-p origin)
+               (with-current-buffer origin
+                 (when (= token chief/cljd--dart-nav-request-token)
+                   (message "Dart navigation helper failed for %s: %s" target reason)
+                   (chief/cljd--dart-nav-fallback-open-library origin uri target)))))))
+       pending)
+      (clrhash pending))))
+
+(defun chief/cljd--dart-nav-dispose-session (key &optional reason)
+  "Dispose of the persistent helper session stored under KEY.
+When REASON is non-nil, fail pending resolve requests with it first."
+  (when-let* ((session (chief/cljd--dart-nav-session key)))
+    (setf (plist-get session :closing) t)
+    (when reason
+      (chief/cljd--dart-nav-fail-pending-requests session reason))
+    (remhash key chief/cljd--dart-nav-sessions)
+    (chief/cljd--dart-nav-kill-session-processes session)))
+
+(defun chief/cljd-shutdown-dart-navigation-helpers ()
+  "Shut down every persistent CLJD Dart navigation helper session."
+  (interactive)
+  (maphash (lambda (key _session)
+             (chief/cljd--dart-nav-dispose-session key))
+           chief/cljd--dart-nav-sessions)
+  (clrhash chief/cljd--dart-nav-sessions))
+
+(defun chief/cljd--dart-nav-parse-json (string)
+  "Parse helper JSON STRING into an alist."
+  (json-parse-string
+   string
+   :object-type 'alist
+   :array-type 'list
+   :null-object nil
+   :false-object nil))
 
 (defun chief/cljd--dart-nav-open-result (origin payload)
   "Open Dart navigation result PAYLOAD from ORIGIN."
@@ -386,50 +654,198 @@ wait before failing or falling back to opening the library file."
           (find-file file)))
     (message "No Dart definition target found for %s" target)))
 
-(defun chief/cljd--dart-nav-process-sentinel (process _event)
-  "Handle completion of the asynchronous CLJD -> Dart PROCESS."
-  (when (memq (process-status process) '(exit signal))
-    (let* ((origin (process-get process :origin-buffer))
-           (token (process-get process :token))
-           (uri (process-get process :uri))
-           (target (process-get process :target))
-           (stdout (string-trim (or (process-get process :stdout) "")))
-           (stderr-buffer (process-get process :stderr-buffer))
-           (stderr (when (buffer-live-p stderr-buffer)
-                     (with-current-buffer stderr-buffer
-                       (string-trim (buffer-string))))))
-      (when (buffer-live-p origin)
-        (with-current-buffer origin
-          (when (eq chief/cljd--dart-nav-process process)
-            (setq chief/cljd--dart-nav-process nil))
-          (when (= token chief/cljd--dart-nav-request-token)
-            (condition-case err
-                (let ((payload (and (not (string-empty-p stdout))
-                                    (chief/cljd--dart-nav-parse-helper-output stdout))))
-                  (cond
-                   ((and payload (alist-get 'ok payload))
-                    (puthash (chief/cljd--dart-nav-cache-key
-                              uri
-                              (alist-get 'symbol payload)
-                              (alist-get 'member payload))
-                             payload
-                             chief/cljd-dart-nav-cache)
-                    (chief/cljd--dart-nav-open-result origin payload))
-                   (payload
-                    (message "Dart navigation helper could not resolve %s: %s"
-                             target
-                             (or (alist-get 'error payload) "unknown error"))
-                    (chief/cljd--dart-nav-fallback-open-library origin uri target))
-                   (t
-                    (message "Dart navigation helper returned no data for %s" target))))
-              (error
-               (message "Failed to parse Dart navigation result for %s: %s"
-                        target
-                        (error-message-string err)))))))
-      (when (and stderr (not (string-empty-p stderr)))
-        (message "Dart navigation helper: %s" stderr))
-      (when (buffer-live-p stderr-buffer)
-        (kill-buffer stderr-buffer)))))
+(defun chief/cljd--dart-nav-flush-session-queue (session)
+  "Send any queued requests now that SESSION has a live socket connection."
+  (when-let* ((connection (plist-get session :connection))
+              ((process-live-p connection)))
+    (dolist (payload (plist-get session :queue))
+      (process-send-string connection payload))
+    (setf (plist-get session :queue) nil)))
+
+(defun chief/cljd--dart-nav-handle-response (session payload)
+  "Handle helper SESSION response PAYLOAD."
+  (let* ((request-id (alist-get 'id payload))
+         (pending (plist-get session :pending))
+         (metadata (and request-id (hash-table-p pending) (gethash request-id pending))))
+    (when (and request-id (hash-table-p pending))
+      (remhash request-id pending))
+    (pcase (plist-get metadata :kind)
+      ('prewarm
+       (unless (alist-get 'ok payload)
+         (message "CLJD Dart navigation prewarm failed: %s"
+                  (or (alist-get 'error payload) "unknown error"))))
+      ('resolve
+       (let ((origin (plist-get metadata :origin-buffer))
+             (token (plist-get metadata :token))
+             (uri (plist-get metadata :uri))
+             (target (plist-get metadata :target)))
+         (when (buffer-live-p origin)
+           (with-current-buffer origin
+             (when (= token chief/cljd--dart-nav-request-token)
+               (cond
+                ((and (alist-get 'ok payload) (alist-get 'file payload))
+                 (puthash (chief/cljd--dart-nav-cache-key
+                           uri
+                           (alist-get 'symbol payload)
+                           (alist-get 'member payload))
+                          payload
+                          chief/cljd-dart-nav-cache)
+                 (chief/cljd--dart-nav-open-result origin payload))
+                ((alist-get 'ok payload)
+                 (message "Dart navigation helper returned no location for %s" target)
+                 (chief/cljd--dart-nav-fallback-open-library origin uri target))
+                (t
+                 (message "Dart navigation helper could not resolve %s: %s"
+                          target
+                          (or (alist-get 'error payload) "unknown error"))
+                 (chief/cljd--dart-nav-fallback-open-library origin uri target)))))))))))
+
+(defun chief/cljd--dart-nav-connection-filter (process chunk)
+  "Handle CHUNK from a persistent helper socket PROCESS."
+  (when-let* ((key (process-get process :session-key))
+              (session (chief/cljd--dart-nav-session key)))
+    (let ((buffer (concat (or (plist-get session :connection-stdout) "") chunk))
+          line)
+      (while (string-match "\n" buffer)
+        (setq line (substring buffer 0 (match-beginning 0))
+              buffer (substring buffer (match-end 0)))
+        (unless (string-empty-p (string-trim line))
+          (condition-case err
+              (chief/cljd--dart-nav-handle-response
+               session
+               (chief/cljd--dart-nav-parse-json line))
+            (error
+             (message "Failed to parse CLJD Dart helper response: %s"
+                      (error-message-string err))))))
+      (setf (plist-get session :connection-stdout) buffer))))
+
+(defun chief/cljd--dart-nav-connection-sentinel (process _event)
+  "Handle helper socket PROCESS state changes."
+  (when (memq (process-status process) '(closed failed exit signal))
+    (when-let* ((key (process-get process :session-key))
+                (session (chief/cljd--dart-nav-session key))
+                ((not (plist-get session :closing))))
+      (chief/cljd--dart-nav-dispose-session key "lost persistent helper connection"))))
+
+(defun chief/cljd--dart-nav-connect-session (session key)
+  "Connect SESSION stored under KEY to its helper Unix socket."
+  (unless (and (processp (plist-get session :connection))
+               (process-live-p (plist-get session :connection)))
+    (let ((connection (make-network-process
+                       :name (format "cljd-dart-nav-conn:%s" (file-name-nondirectory key))
+                       :family 'local
+                       :service (plist-get session :socket-path)
+                       :coding 'utf-8-unix
+                       :noquery t
+                       :filter #'chief/cljd--dart-nav-connection-filter
+                       :sentinel #'chief/cljd--dart-nav-connection-sentinel)))
+      (process-put connection :session-key key)
+      (setf (plist-get session :connection) connection)
+      (when-let* ((timer (plist-get session :connect-timer)))
+        (cancel-timer timer)
+        (setf (plist-get session :connect-timer) nil))
+      (chief/cljd--dart-nav-flush-session-queue session))))
+
+(defun chief/cljd--dart-nav-maybe-connect-session (key)
+  "Try to connect the persistent helper session stored under KEY."
+  (when-let* ((session (chief/cljd--dart-nav-session key)))
+    (cond
+     ((plist-get session :closing)
+      (when-let* ((timer (plist-get session :connect-timer)))
+        (cancel-timer timer)
+        (setf (plist-get session :connect-timer) nil)))
+     ((and (processp (plist-get session :connection))
+           (process-live-p (plist-get session :connection)))
+      (when-let* ((timer (plist-get session :connect-timer)))
+        (cancel-timer timer)
+        (setf (plist-get session :connect-timer) nil)))
+     ((and (processp (plist-get session :helper))
+           (process-live-p (plist-get session :helper))
+           (file-exists-p (plist-get session :socket-path)))
+      (condition-case nil
+          (chief/cljd--dart-nav-connect-session session key)
+        (file-error nil))))))
+
+(defun chief/cljd--dart-nav-helper-filter (_process _chunk)
+  "Ignore helper stdout in persistent helper mode."
+  nil)
+
+(defun chief/cljd--dart-nav-helper-sentinel (process _event)
+  "Handle persistent helper PROCESS state changes."
+  (when (memq (process-status process) '(exit signal failed closed))
+    (when-let* ((key (process-get process :session-key))
+                (session (chief/cljd--dart-nav-session key)))
+      (let ((stderr-buffer (plist-get session :stderr-buffer))
+            (closing (plist-get session :closing)))
+        (unless closing
+          (let ((stderr (when (buffer-live-p stderr-buffer)
+                          (with-current-buffer stderr-buffer
+                            (string-trim (buffer-string))))))
+            (chief/cljd--dart-nav-dispose-session
+             key
+             (if (and stderr (not (string-empty-p stderr)))
+                 stderr
+               "persistent helper exited unexpectedly"))))))))
+
+(defun chief/cljd--dart-nav-start-session (key)
+  "Start and register a persistent helper session for KEY."
+  (chief/cljd--dart-nav-install-cleanup)
+  (let* ((stderr-buffer (generate-new-buffer " *cljd-dart-nav-helper-stderr*"))
+         (socket-path (chief/cljd--dart-nav-helper-socket-path key))
+         (session (list :project-root key
+                        :pending (make-hash-table :test #'eql)
+                        :queue nil
+                        :helper nil
+                        :connection nil
+                        :connect-timer nil
+                        :closing nil
+                        :prewarm-requested nil
+                        :connection-stdout ""
+                        :socket-path socket-path
+                        :stderr-buffer stderr-buffer))
+         (helper (make-process
+                  :name (format "cljd-dart-nav-helper:%s" (file-name-nondirectory key))
+                  :command (chief/cljd--dart-nav-helper-start-command key)
+                  :connection-type 'pipe
+                  :coding 'utf-8-unix
+                  :noquery t
+                  :buffer nil
+                  :stderr stderr-buffer
+                  :filter #'chief/cljd--dart-nav-helper-filter
+                  :sentinel #'chief/cljd--dart-nav-helper-sentinel)))
+    (process-put helper :session-key key)
+    (setf (plist-get session :helper) helper)
+    (puthash key session chief/cljd--dart-nav-sessions)
+    (setf (plist-get session :connect-timer)
+          (run-at-time 0.05 0.1 #'chief/cljd--dart-nav-maybe-connect-session key))
+    session))
+
+(defun chief/cljd--ensure-dart-nav-session (&optional root)
+  "Return a live persistent helper session for ROOT or the current project."
+  (let* ((key (chief/cljd--dart-nav-session-key root))
+         (session (chief/cljd--dart-nav-session key)))
+    (unless (chief/cljd--dart-nav-session-live-p session)
+      (when session
+        (chief/cljd--dart-nav-dispose-session key))
+      (setq session (chief/cljd--dart-nav-start-session key)))
+    session))
+
+(defun chief/cljd--dart-nav-send-request (session payload &optional metadata)
+  "Send PAYLOAD through persistent helper SESSION.
+When METADATA is non-nil, track the request for later response handling."
+  (let* ((request-id (cl-incf chief/cljd--dart-nav-next-request-id))
+         (pending (plist-get session :pending))
+         (request (append `((id . ,request-id)) payload))
+         (encoded (concat (json-serialize request :false-object :json-false :null-object nil)
+                          "\n")))
+    (when metadata
+      (puthash request-id metadata pending))
+    (if (and (processp (plist-get session :connection))
+             (process-live-p (plist-get session :connection)))
+        (process-send-string (plist-get session :connection) encoded)
+      (setf (plist-get session :queue)
+            (append (plist-get session :queue) (list encoded))))
+    request-id))
 
 (defun chief/cljd-goto-dart-definition-async (uri symbol &optional member)
   "Resolve and jump to Dart definition for URI, SYMBOL, and optional MEMBER."
@@ -448,35 +864,37 @@ wait before failing or falling back to opening the library file."
      ((null roots)
       (chief/cljd--dart-nav-fallback-open-library origin uri target))
      (t
-      (when (process-live-p chief/cljd--dart-nav-process)
-        (kill-process chief/cljd--dart-nav-process))
-      (if-let* ((command (chief/cljd--dart-nav-helper-command roots uri symbol member file)))
-          (let ((stderr-buffer (generate-new-buffer " *cljd-dart-nav-stderr*")))
-            (setq chief/cljd--dart-nav-process
-                  (make-process
-                   :name "cljd-dart-nav"
-                   :command command
-                   :connection-type 'pipe
-                   :noquery t
-                   :buffer nil
-                   :stderr stderr-buffer
-                   :filter #'chief/cljd--dart-nav-process-filter
-                   :sentinel #'chief/cljd--dart-nav-process-sentinel))
-            (process-put chief/cljd--dart-nav-process :origin-buffer origin)
-            (process-put chief/cljd--dart-nav-process :token token)
-            (process-put chief/cljd--dart-nav-process :uri uri)
-            (process-put chief/cljd--dart-nav-process :target target)
-            (process-put chief/cljd--dart-nav-process :stderr-buffer stderr-buffer)
-            (message "Resolving Dart definition for %s..." target))
-        (chief/cljd--dart-nav-fallback-open-library origin uri target))))))
+      (let ((session (chief/cljd--ensure-dart-nav-session)))
+        (chief/cljd--dart-nav-send-request
+         session
+         `((op . "resolve")
+           (roots . ,(vconcat roots))
+           (timeout . ,chief/cljd-dart-navigation-timeout)
+           (uri . ,uri)
+           (file . ,file)
+           (symbol . ,symbol)
+           (member . ,member))
+         `(:kind resolve
+           :origin-buffer ,origin
+           :token ,token
+           :uri ,uri
+           :target ,target))
+        (message "Resolving Dart definition for %s..." target))))))
 
 (defun chief/cljd-prewarm-dart-navigation ()
-  "Warm the CLJD -> Dart helper path for the current project."
+  "Warm the persistent CLJD -> Dart helper for the current project."
   (when-let* ((root (chief/cljd-project-root))
               ((chief/lsp-dart-sdk-executable)))
-    ;; Nothing to do yet beyond proving the helper dependencies exist.
-    root))
-
+    (let ((session (chief/cljd--ensure-dart-nav-session root)))
+      (unless (plist-get session :prewarm-requested)
+        (setf (plist-get session :prewarm-requested) t)
+        (chief/cljd--dart-nav-send-request
+         session
+         `((op . "prewarm")
+           (roots . ,(vector (chief/cljd--dart-nav-session-key root)))
+           (timeout . ,chief/cljd-dart-navigation-timeout))
+         '(:kind prewarm)))
+      root)))
 (defun chief/cljd--ns-form-bounds ()
   "Return the bounds of the current buffer's top-level `ns' form."
   (save-excursion
@@ -712,6 +1130,52 @@ wait before failing or falling back to opening the library file."
   (when-let* ((buffer (chief/cljd-repl-buffer)))
     (get-buffer-process buffer)))
 
+(defun chief/cljd--legacy-repl-process-p (process)
+  "Return non-nil when PROCESS is not the current CLJD REPL backend."
+  (when (process-live-p process)
+    (not (memq (process-get process :chief/cljd-backend)
+               '(inferior-lisp socket-elisp)))))
+
+(defun chief/cljd-repl-process-filter (process string)
+  "Insert STRING from PROCESS into the CLJD REPL buffer via comint."
+  (when-let* ((buffer (process-buffer process))
+              ((buffer-live-p buffer)))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (comint-output-filter process string)))))
+
+(defun chief/cljd--create-repl-process (buffer root port)
+  "Create a CLJD network REPL process in BUFFER rooted at ROOT on PORT."
+  (with-current-buffer buffer
+    (setq default-directory root)
+    (let* ((inhibit-read-only t)
+           (proc (make-network-process :name "cljd-repl"
+                                       :buffer buffer
+                                       :host "localhost"
+                                       :service port
+                                       :coding 'utf-8-unix
+                                       :noquery t
+                                       :filter #'chief/cljd-repl-process-filter
+                                       :sentinel #'chief/cljd-repl-process-sentinel)))
+      (unless (process-live-p proc)
+        (user-error "Failed to start the ClojureDart REPL transport"))
+      (chief/cljd-repl-mode)
+      (setq inferior-lisp-buffer buffer)
+      (set-process-query-on-exit-flag proc nil)
+      (process-put proc :chief/cljd-backend 'socket-elisp)
+      (process-put proc :chief/cljd-pending-requests nil)
+      (goto-char (point-max))
+      (when (= (buffer-size) 0)
+        (insert (format "; Connected to ClojureDart REPL on port %d.\n; If the prompt does not appear immediately, press RET once.\n\n"
+                        port)))
+      (set-marker (process-mark proc) (point-max) buffer)
+      ;; Follow the upstream inferior-lisp guidance: a blank RET is enough to
+      ;; make the prompt appear when the socket REPL has not printed it yet.
+      (chief/cljd--register-repl-request proc nil :discard-output t)
+      (process-send-string proc "\n")
+      (chief/cljd-wait-for-repl-prompt proc)
+      proc)))
+
 (defun chief/cljd-connect-repl (&optional port)
   "Connect to the ClojureDart socket REPL on PORT."
   (interactive)
@@ -725,29 +1189,16 @@ wait before failing or falling back to opening the library file."
     (unless (and (integerp port) (> port 0))
       (user-error "No ClojureDart socket REPL port detected; start `clj -M:%s flutter` or `clj -M:%s dart` first"
                   chief/cljd-alias chief/cljd-alias))
-    (unless (executable-find chief/cljd-netcat-command)
-      (user-error "%s is not available on PATH" chief/cljd-netcat-command))
-    (let ((new-process-p nil))
-      (unless (process-live-p process)
-        (setq new-process-p t)
-        (setq process
-              (make-comint-in-buffer
-               "cljd-repl"
-               buffer
-               chief/cljd-netcat-command
-               nil
-               "localhost"
-               (number-to-string port))))
-      (with-current-buffer buffer
-        (setq default-directory root)
-        (chief/cljd-repl-mode)
-        (when (and new-process-p (= (buffer-size) 0))
-          (insert (format "; Connected to ClojureDart REPL on port %d.\n; If the prompt does not appear immediately, press RET once.\n\n"
-                          port))))
-      ;; ClojureDart's socket REPL often doesn't render its prompt/banner
-      ;; until the first newline reaches the server.
-      (when new-process-p
-        (comint-send-string process "\n")))
+    (when (chief/cljd--legacy-repl-process-p process)
+      (kill-process process)
+      (setq process nil))
+    (unless (process-live-p process)
+      (setq process (chief/cljd--create-repl-process buffer root port))
+      (process-put process :chief/cljd-port port))
+    (with-current-buffer buffer
+      (goto-char (point-max))
+      (when (fboundp 'evil-insert-state)
+        (evil-insert-state)))
     (pop-to-buffer-same-window buffer)))
 
 (defun chief/cljd-restart-dwim ()
@@ -780,27 +1231,74 @@ TIMEOUT defaults to `chief/cljd-repl-start-timeout'."
       (setq process (chief/cljd--watch-process)))
     port))
 
+(defun chief/cljd-watch-ready-p (&optional buffer)
+  "Return non-nil when BUFFER's Flutter watcher finished its initial reload."
+  (if (not (eq (chief/cljd-project-kind) 'flutter))
+      t
+    (when-let* ((buffer (or buffer (chief/cljd--watch-buffer)))
+                ((buffer-live-p buffer)))
+      (with-current-buffer buffer
+        (save-excursion
+          (goto-char (point-max))
+          (when (re-search-backward chief/cljd-repl-port-regexp nil t)
+            (re-search-forward chief/cljd-watch-reloaded-regexp nil t)))))))
+
+(defun chief/cljd-wait-for-watch-ready (&optional timeout)
+  "Wait until the current Flutter watcher is ready for interactive REPL evals."
+  (if (not (eq (chief/cljd-project-kind) 'flutter))
+      t
+    (let* ((timeout (or timeout chief/cljd-repl-watch-ready-timeout))
+           (deadline (+ (float-time) timeout))
+           (settle-delay chief/cljd-repl-watch-settle-delay)
+           (start (float-time))
+           (process (chief/cljd--watch-process)))
+      (while (and (< (float-time) deadline)
+                  (and process (process-live-p process))
+                  (not (or (chief/cljd-watch-ready-p)
+                           (>= (- (float-time) start) settle-delay))))
+        (accept-process-output process 0.25)
+        (setq process (chief/cljd--watch-process)))
+      (or (chief/cljd-watch-ready-p)
+          (and process (process-live-p process))
+          nil))))
+
 (defun chief/cljd-start-repl ()
   "Start or connect to the current project's ClojureDart REPL."
   (interactive)
   (let ((repl-process (chief/cljd-repl-process))
-        (watch-process (chief/cljd--watch-process)))
+        (watch-process (chief/cljd--watch-process))
+        (lock-state (chief/cljd--repl-lock-state)))
+    (when (chief/cljd--legacy-repl-process-p repl-process)
+      (kill-process repl-process)
+      (setq repl-process nil))
     (cond
      ((process-live-p repl-process)
       (pop-to-buffer-same-window (chief/cljd-repl-buffer)))
      ((when-let* ((port (chief/cljd-detect-repl-port)))
+        (when (and watch-process
+                   (process-live-p watch-process)
+                   (not (chief/cljd-wait-for-watch-ready)))
+          (user-error "Timed out waiting for the ClojureDart app to finish its initial reload"))
         (chief/cljd-connect-repl port)
         t))
      ((and watch-process (process-live-p watch-process))
-      (message "Waiting for existing ClojureDart watcher...")
       (if-let* ((port (chief/cljd-wait-for-repl-port)))
-          (chief/cljd-connect-repl port)
+          (progn
+            (unless (chief/cljd-wait-for-watch-ready)
+              (user-error "Timed out waiting for the ClojureDart app to finish its initial reload"))
+            (chief/cljd-connect-repl port))
         (user-error "Timed out waiting for the ClojureDart socket REPL")))
+     ((plist-get lock-state :port)
+      (user-error "ClojureDart REPL port %s is unavailable; restart the external watcher first"
+                  (plist-get lock-state :port)))
      (t
       (chief/cljd-watch-dwim)
       (message "Waiting for ClojureDart REPL...")
       (if-let* ((port (chief/cljd-wait-for-repl-port)))
-          (chief/cljd-connect-repl port)
+          (progn
+            (unless (chief/cljd-wait-for-watch-ready)
+              (user-error "Timed out waiting for the ClojureDart app to finish its initial reload"))
+            (chief/cljd-connect-repl port))
         (user-error "Timed out waiting for the ClojureDart socket REPL"))))))
 
 (defun chief/cljd--ensure-repl-process ()
@@ -840,14 +1338,16 @@ TIMEOUT defaults to `chief/cljd-repl-start-timeout'."
   (when-let* ((namespace (or namespace (chief/cljd-buffer-namespace))))
     (format "(ns %s)\n" namespace)))
 
-(defun chief/cljd--prepare-eval-string (string &optional namespace)
-  "Return STRING prepared for evaluation in NAMESPACE."
-  (if (or (string-empty-p string)
-          (chief/cljd--string-starts-with-ns-form-p string))
-      string
-    (if-let* ((prefix (chief/cljd--namespace-prefix namespace)))
-        (concat prefix string)
-      string)))
+(defun chief/cljd--wrap-in-current-namespace (string &optional namespace)
+  "Prefix STRING with an `ns' form so it evaluates within NAMESPACE."
+  (if-let* ((prefix (chief/cljd--namespace-prefix namespace)))
+      (concat prefix (string-trim-right string "[\r\n]+"))
+    string))
+
+(defun chief/cljd--prepare-eval-string (string &optional _namespace)
+  "Return STRING prepared for evaluation.
+Namespace switching is handled as a separate REPL submission." 
+  string)
 
 (defun chief/cljd--buffer-body-string ()
   "Return the current buffer body without the leading `ns' form."
@@ -864,24 +1364,66 @@ TIMEOUT defaults to `chief/cljd-repl-start-timeout'."
        (buffer-substring-no-properties (point-min) (point-max))))))
 
 (defun chief/cljd-buffer-eval-string ()
-  "Return the current buffer prepared for ClojureDart REPL evaluation."
-  (let ((namespace (chief/cljd-buffer-namespace))
-        (body (chief/cljd--buffer-body-string)))
-    (if-let* ((prefix (chief/cljd--namespace-prefix namespace)))
-        (concat prefix body)
-      body)))
+  "Return the current buffer body prepared for ClojureDart REPL evaluation."
+  (chief/cljd--buffer-body-string))
+
+(defun chief/cljd--submit-to-repl (string &optional result-marker namespace)
+  "Submit STRING to the CLJD REPL and associate RESULT-MARKER with its reply.
+When NAMESPACE is non-nil, switch the REPL there first via a separate `ns' form."
+  (let* ((process (chief/cljd--ensure-repl-process))
+         (payload (string-trim-right string "[\r\n]+"))
+         (ns-form (chief/cljd--namespace-prefix namespace)))
+    (cond
+     ((string-empty-p payload)
+      (when ns-form
+        (chief/cljd--send-repl-input
+         process
+         (string-trim-right ns-form "[\r\n]+"))))
+     ((chief/cljd--string-starts-with-ns-form-p payload)
+      (chief/cljd--send-repl-input process payload result-marker))
+     (ns-form
+      (chief/cljd--send-repl-input
+       process
+       (string-trim-right ns-form "[\r\n]+"))
+      (chief/cljd-wait-for-repl-prompt process)
+      (chief/cljd--send-repl-input process payload result-marker))
+     (t
+      (chief/cljd--send-repl-input process payload result-marker)))
+    process))
+
+(defun chief/cljd-last-sexp-bounds ()
+  "Return the bounds of the sexp ending at point."
+  (save-excursion
+    (let ((end (point)))
+      (backward-sexp)
+      (cons (point) end))))
+
+(defun chief/cljd-send-last-sexp ()
+  "Send the sexp before point to the active ClojureDart REPL."
+  (interactive)
+  (pcase-let ((`(,start . ,end) (chief/cljd-last-sexp-bounds)))
+    (chief/cljd-send-region start end)))
 
 (defun chief/cljd-send-string (string)
   "Send STRING to the active ClojureDart socket REPL."
-  (let ((process (chief/cljd--ensure-repl-process)))
-    (comint-send-string process (chief/cljd--prepare-eval-string string))
-    (unless (string-suffix-p "\n" string)
-      (comint-send-string process "\n"))))
+  (let* ((target-buffer (current-buffer))
+         (result-marker (and (buffer-live-p target-buffer)
+                             (with-current-buffer target-buffer
+                               (copy-marker (line-end-position) t))))
+         (namespace (unless (chief/cljd--string-starts-with-ns-form-p string)
+                      (chief/cljd-buffer-namespace)))
+         (payload (chief/cljd--prepare-eval-string string)))
+    (chief/cljd--submit-to-repl payload result-marker namespace)))
 
 (defun chief/cljd-send-region (start end)
   "Send the region from START to END to the socket REPL."
   (interactive "r")
-  (chief/cljd-send-string (buffer-substring-no-properties start end)))
+  (let* ((string (buffer-substring-no-properties start end))
+         (payload (chief/cljd--prepare-eval-string string))
+         (namespace (unless (chief/cljd--string-starts-with-ns-form-p string)
+                      (chief/cljd-buffer-namespace)))
+         (result-marker (copy-marker end t)))
+    (chief/cljd--submit-to-repl payload result-marker namespace)))
 
 (defun chief/cljd-send-line ()
   "Send the current line to the socket REPL."
@@ -899,11 +1441,10 @@ TIMEOUT defaults to `chief/cljd-repl-start-timeout'."
 (defun chief/cljd-send-buffer ()
   "Send the current buffer to the socket REPL."
   (interactive)
-  (let ((process (chief/cljd--ensure-repl-process))
-        (string (chief/cljd-buffer-eval-string)))
-    (comint-send-string process string)
-    (unless (string-suffix-p "\n" string)
-      (comint-send-string process "\n"))))
+  (let ((string (chief/cljd-buffer-eval-string))
+        (namespace (chief/cljd-buffer-namespace))
+        (result-marker (copy-marker (point-max) t)))
+    (chief/cljd--submit-to-repl string result-marker namespace)))
 
 (defun chief/cljd-mode-setup ()
   "Configure ClojureDart buffers."
@@ -926,6 +1467,12 @@ TIMEOUT defaults to `chief/cljd-repl-start-timeout'."
 (use-package clojure-mode
   :mode ("\\.cljd\\'" . clojuredart-mode)
   :hook (clojuredart-mode . chief/cljd-mode-setup))
+
+(define-key clojuredart-mode-map (kbd "C-x C-e") #'chief/cljd-send-last-sexp)
+(define-key clojuredart-mode-map (kbd "C-M-x") #'chief/cljd-send-defun)
+(define-key clojuredart-mode-map (kbd "C-c C-z") #'chief/cljd-start-repl)
+(define-key clojuredart-mode-map (kbd "C-c C-k") #'chief/cljd-send-buffer)
+(define-key clojuredart-mode-map (kbd "C-c C-r") #'chief/cljd-send-region)
 
 (chief/repl-setup-standard-local-leader 'clojuredart-mode-map)
 
