@@ -33,6 +33,7 @@ Keeping this nil generally reduces background work in large monorepos."
   :type 'boolean
   :group 'chief)
 
+
 (defun chief/go-project-root ()
   "Return the current Go project root, if any."
   (chief/project-preferred-root
@@ -224,9 +225,102 @@ Keeping this nil generally reduces background work in large monorepos."
   :mode ("\\.go\\'" . go-mode)
   :hook (go-mode . chief/go-mode-setup))
 
-(chief/safe-use-package templ-ts-mode
-  :mode ("\\.templ\\'" . templ-ts-mode)
-  :hook (templ-ts-mode . chief/templ-mode-setup))
+(with-eval-after-load 'go-ts-mode
+  ;; `templ-ts-mode' currently depends on private `go-ts-mode' helpers that were
+  ;; removed in newer Emacs releases. Provide tiny compatibility shims so the
+  ;; mode can still initialize on Emacs 31.
+  (unless (fboundp 'go-ts-mode--iota-query-supported-p)
+    (defun go-ts-mode--iota-query-supported-p () t))
+  (unless (fboundp 'go-ts-mode--method-elem-supported-p)
+    (defun go-ts-mode--method-elem-supported-p () t)))
+
+(with-eval-after-load 'js
+  ;; Newer Emacs versions expose these as functions instead of vars.
+  (unless (boundp 'js--treesit-indent-rules)
+    (defvar js--treesit-indent-rules (js--treesit-indent-rules)))
+  (unless (boundp 'js--treesit-font-lock-settings)
+    (defvar js--treesit-font-lock-settings (js--treesit-font-lock-settings))))
+
+(defun chief/templ-ts-mode--stub-eglot-require (orig feature &rest args)
+  "Let `templ-ts-mode' load without pulling in Eglot.
+The upstream package only uses Eglot to append to `eglot-server-programs', while
+this config uses `lsp-mode' for templ buffers."
+  (if (eq feature 'eglot)
+      (progn
+        (defvar eglot-server-programs nil)
+        'eglot)
+    (apply orig feature args)))
+
+(defun chief/templ-ts--language-at-point (point)
+  "Return the embedded language at POINT inside a templ buffer."
+  (let ((templ-parser (treesit-parser-create 'templ))
+        (js-parser (treesit-parser-create 'javascript))
+        (css-parser (treesit-parser-create 'css)))
+    (cond
+     ((treesit-parser-range-on css-parser point) 'css)
+     ((treesit-parser-range-on js-parser point) 'javascript)
+     ((treesit-parser-range-on templ-parser point) 'templ)
+     (t 'templ))))
+
+(defun chief/templ-ts--setup ()
+  "Compatibility wrapper for `templ-ts-mode' on newer Emacs releases."
+  (unless (treesit-available-p)
+    (error "Tree-sitter is not available"))
+  (unless (and (treesit-language-available-p 'templ)
+               (treesit-language-available-p 'javascript)
+               (treesit-language-available-p 'jsdoc)
+               (treesit-language-available-p 'css))
+    (error "templ-ts-mode needs the templ, javascript, jsdoc, and css tree-sitter grammars"))
+  (setq-local treesit-language-source-alist
+              `((templ . (,templ-ts-mode-grammar))))
+  (treesit-parser-create 'templ)
+  (treesit-parser-create 'javascript)
+  (treesit-parser-create 'css)
+  (setq-local comment-start "// "
+              comment-end ""
+              comment-start-skip (rx "//" (* (syntax whitespace))))
+  (setq-local treesit-language-at-point-function #'chief/templ-ts--language-at-point)
+  (setq-local treesit-range-settings
+              (treesit-range-rules
+               :embed 'javascript
+               :host 'templ
+               '((script_block_text) @javascript)
+               :embed 'css
+               :host 'templ
+               '((style_element_text) @css)))
+  (setq-local indent-tabs-mode t
+              treesit-simple-indent-rules templ-ts--indent-rules)
+  (setq-local electric-indent-chars
+              (append "{}()<>" electric-indent-chars))
+  (setq-local treesit-font-lock-feature-list templ-ts--font-lock-feature-list)
+  (setq-local treesit-font-lock-settings
+              (append js--treesit-font-lock-settings
+                      css--treesit-settings
+                      (apply #'treesit-font-lock-rules
+                             (append templ-ts--templ-font-lock-rules
+                                     templ-ts--go-font-lock-rules))))
+  (treesit-major-mode-setup))
+
+(defun chief/load-templ-ts-mode ()
+  "Load and patch `templ-ts-mode' from the Go/Templ module only."
+  (condition-case err
+      (progn
+        (when (fboundp 'straight-use-package)
+          (straight-use-package 'templ-ts-mode))
+        (advice-add 'require :around #'chief/templ-ts-mode--stub-eglot-require)
+        (unwind-protect
+            (require 'templ-ts-mode)
+          (advice-remove 'require #'chief/templ-ts-mode--stub-eglot-require))
+        (advice-add 'templ-ts--setup :override #'chief/templ-ts--setup)
+        (add-to-list 'auto-mode-alist '("\\.templ\\'" . templ-ts-mode))
+        (add-hook 'templ-ts-mode-hook #'chief/templ-mode-setup))
+    (error
+     (display-warning 'chief
+                      (format "Failed to initialize package templ-ts-mode: %s"
+                              (error-message-string err))
+                      :warning))))
+
+(chief/load-templ-ts-mode)
 
 (when (fboundp 'go-ts-mode)
   (add-hook 'go-ts-mode-hook #'chief/go-mode-setup))

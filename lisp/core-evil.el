@@ -36,12 +36,14 @@
   (setq evil-undo-system 'undo-redo)
   :config
   (evil-mode 1)
-  (general-define-key
-   :states '(normal visual motion)
-   "C-h" #'windmove-left
-   "C-j" #'windmove-down
-   "C-k" #'windmove-up
-   "C-l" #'windmove-right)
+  ;; Undo any old global C-h/j/k/l window bindings on reload.
+  ;; Removing the old `general-define-key' form from the config file is not
+  ;; enough, because reloading doesn't automatically scrub existing keymap
+  ;; entries.
+  (when (fboundp 'general-unbind)
+    (general-unbind :states '(normal visual motion)
+                    "C-h" "C-j" "C-k" "C-l"))
+  ;; Keep Evil's default C-w window map intact; do not steal C-h/j/k/l.
   (general-define-key
    :states '(visual)
    "gc" #'chief/evil-comment-dwim)

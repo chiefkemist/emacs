@@ -8,6 +8,12 @@
 (require 'subr-x)
 
 (require 'typescript-ts-mode nil t)
+(require 'web-mode nil t)
+
+(chief/safe-use-package json-mode
+  :commands (json-mode jsonc-mode))
+
+(put 'typescript-mode 'derived-mode-parent 'prog-mode)
 
 (defcustom chief/jsts-default-runtime 'auto
   "Default runtime used for JavaScript and TypeScript buffers."
@@ -29,6 +35,11 @@
   :type 'string
   :group 'chief)
 
+(defcustom chief/jsts-esbuild-command "esbuild"
+  "Executable used to transpile JS/TS snippets for runtimes that need plain JS."
+  :type 'string
+  :group 'chief)
+
 (defvar chief/jsts-runtime-history nil
   "History for `chief/jsts-set-runtime'.")
 
@@ -36,32 +47,122 @@
   "Buffer-local JS/TS runtime override.
 When nil or `auto', this module detects the runtime from the project.")
 
-(defun chief/jsts-project-root ()
-  "Return the current JS/TS project root."
+(defun chief/jsts-workspace-root ()
+  "Return the current JS/TS workspace root, if any."
   (chief/project-preferred-root
-   '("deno.json" "deno.jsonc"
-     "pnpm-workspace.yaml"
+   '("pnpm-workspace.yaml"
      "turbo.json"
      "nx.json"
      "lerna.json"
-     "bunfig.toml"
-     "bun.lock"
-     "bun.lockb"
      "package-lock.json"
      "pnpm-lock.yaml"
      "yarn.lock")
-   '("package.json" "tsconfig.json" "jsconfig.json")
    (chief/project-current-root)
    default-directory))
+
+(defun chief/jsts-package-root ()
+  "Return the nearest JS/TS package root, if any."
+  (chief/project-preferred-root
+   '("deno.json"
+     "deno.jsonc"
+     "bunfig.toml"
+     "bun.lock"
+     "bun.lockb"
+     "package.json"
+     "tsconfig.json"
+     "jsconfig.json")
+   default-directory))
+
+(defun chief/jsts-project-root ()
+  "Return the preferred JS/TS workspace root for the current buffer."
+  (let* ((package-root (chief/jsts-package-root))
+         (workspace-root (chief/jsts-workspace-root))
+         (deno-root (when package-root
+                      (or (file-exists-p (expand-file-name "deno.json" package-root))
+                          (file-exists-p (expand-file-name "deno.jsonc" package-root))))))
+    (or (and deno-root package-root)
+        workspace-root
+        package-root
+        (chief/project-current-root)
+        (file-name-as-directory (expand-file-name default-directory)))))
+
+(defun chief/jsts-execution-root ()
+  "Return the preferred package root for running code and starting REPLs."
+  (or (chief/jsts-package-root)
+      (chief/jsts-project-root)
+      (file-name-as-directory (expand-file-name default-directory))))
 
 (defun chief/jsts-project-file-p (name &optional root)
   "Return non-nil when NAME exists under ROOT."
   (let ((root (or root (chief/jsts-project-root))))
     (and root (file-exists-p (expand-file-name name root)))))
 
+(defun chief/jsts-buffer-file-name (&optional file)
+  "Return FILE or the current buffer file name, if any."
+  (or file buffer-file-name ""))
+
+(defun chief/jsts-buffer-kind (&optional file)
+  "Return the content kind for FILE or the current buffer.
+The result is one of `javascript', `jsx', `typescript', `tsx', `json',
+`jsonc', or nil."
+  (let ((name (downcase (chief/jsts-buffer-file-name file))))
+    (cond
+     ((or (derived-mode-p 'jsonc-mode)
+          (string-match-p "\\.jsonc\\'" name))
+      'jsonc)
+     ((or (derived-mode-p 'json-ts-mode)
+          (derived-mode-p 'json-mode)
+          (derived-mode-p 'js-json-mode)
+          (string-match-p "\\.json\\'" name))
+      'json)
+     ((or (derived-mode-p 'tsx-ts-mode)
+          (string-match-p "\\.tsx\\'" name))
+      'tsx)
+     ((or (derived-mode-p 'typescript-ts-mode)
+          (string-match-p "\\.\\(?:d\\.\\)?\\(?:ts\\|mts\\|cts\\)\\'" name))
+      'typescript)
+     ((or (and (derived-mode-p 'web-mode)
+               (string-match-p "\\.\\(?:m?jsx\\|tsx\\)\\'" name))
+          (string-match-p "\\.\\(?:jsx\\|mjsx\\)\\'" name))
+      'jsx)
+     ((or (derived-mode-p 'js-ts-mode)
+          (derived-mode-p 'js-mode)
+          (string-match-p "\\.\\(?:js\\|mjs\\|cjs\\)\\'" name))
+      'javascript))))
+
+(defun chief/jsts-web-template-buffer-p (&optional file)
+  "Return non-nil when FILE or the current buffer is JSX- or TSX-like."
+  (memq (chief/jsts-buffer-kind file) '(jsx tsx)))
+
 (defun chief/jsts-typescript-buffer-p ()
   "Return non-nil when the current buffer contains TypeScript-family code."
-  (derived-mode-p 'typescript-ts-mode 'tsx-ts-mode))
+  (memq (chief/jsts-buffer-kind) '(typescript tsx)))
+
+(defun chief/jsts-code-buffer-p ()
+  "Return non-nil when the current buffer contains executable JS/TS code."
+  (memq (chief/jsts-buffer-kind) '(javascript jsx typescript tsx)))
+
+(defun chief/jsts-json-buffer-p ()
+  "Return non-nil when the current buffer contains JSON-family data."
+  (memq (chief/jsts-buffer-kind) '(json jsonc)))
+
+(defun chief/jsts-buffer-language ()
+  "Return the execution language for the current buffer."
+  (pcase (chief/jsts-buffer-kind)
+    ((or 'tsx 'typescript) 'typescript)
+    ((or 'jsx 'javascript) 'javascript)
+    (_ nil)))
+
+(defun chief/jsts-language-display-name (&optional language)
+  "Return a human-readable display name for LANGUAGE."
+  (pcase (or language (chief/jsts-buffer-kind) (chief/jsts-buffer-language))
+    ('tsx "TSX")
+    ('jsx "JSX")
+    ('typescript "TypeScript")
+    ('javascript "JavaScript")
+    ('json "JSON")
+    ('jsonc "JSONC")
+    (_ "JavaScript/TypeScript")))
 
 (defun chief/jsts-deno-project-p (&optional root)
   "Return non-nil when ROOT looks like a Deno project."
@@ -87,7 +188,7 @@ When nil or `auto', this module detects the runtime from the project.")
   (capitalize (symbol-name (or runtime (chief/jsts-current-runtime)))))
 
 (defun chief/jsts-current-runtime ()
-  "Return the runtime for the current JS/TS buffer."
+  "Return the runtime for the current JS/TS buffer or related config file."
   (let ((explicit (and chief/jsts-runtime
                        (not (eq chief/jsts-runtime 'auto))
                        chief/jsts-runtime))
@@ -152,16 +253,116 @@ When nil or `auto', this module detects the runtime from the project.")
      ((listp value) value)
      (t nil))))
 
-(defun chief/jsts-repl-command (&optional runtime)
-  "Return the command list used to start a REPL for RUNTIME."
-  (let ((runtime (or runtime (chief/jsts-current-runtime))))
+(defun chief/jsts-esbuild-available-p ()
+  "Return non-nil when `esbuild' is available."
+  (executable-find chief/jsts-esbuild-command))
+
+(defun chief/jsts-transpile-file-to-js (file language)
+  "Transpile FILE written in LANGUAGE to a temporary JavaScript module.
+Return the path to the transpiled file."
+  (unless (chief/jsts-esbuild-available-p)
+    (user-error "esbuild is required to run %s on QuickJS" (chief/jsts-language-display-name language)))
+  (let ((output (make-temp-file "chief-jsts-esbuild-" nil ".mjs")))
+    (chief/jsts-run-command
+     (list chief/jsts-esbuild-command
+           file
+           "--format=esm"
+           "--platform=neutral"
+           "--target=es2022"
+           (format "--outfile=%s" output))
+     (chief/jsts-execution-root))
+    output))
+
+(defun chief/jsts-transpile-string-to-js (string language)
+  "Transpile STRING written in LANGUAGE to JavaScript and return it."
+  (let* ((source (chief/jsts-write-temp-file string language))
+         (output nil))
+    (unwind-protect
+        (progn
+          (setq output (chief/jsts-transpile-file-to-js source language))
+          (with-temp-buffer
+            (insert-file-contents output)
+            (buffer-string)))
+      (when (and source (file-exists-p source))
+        (delete-file source))
+      (when (and output (file-exists-p output))
+        (delete-file output)))))
+
+(defun chief/jsts-treesit-ready-for-mode-p (language mode)
+  "Return non-nil when LANGUAGE and MODE can be used right now."
+  (and (fboundp mode)
+       (fboundp 'treesit-ready-p)
+       (treesit-ready-p language t)))
+
+(defun chief/jsts-javascript-major-mode ()
+  "Activate the preferred JavaScript major mode."
+  (interactive)
+  (if (chief/jsts-treesit-ready-for-mode-p 'javascript 'js-ts-mode)
+      (js-ts-mode)
+    (js-mode)))
+
+(defun chief/jsts-typescript-major-mode ()
+  "Activate the preferred TypeScript major mode."
+  (interactive)
+  (if (chief/jsts-treesit-ready-for-mode-p 'typescript 'typescript-ts-mode)
+      (typescript-ts-mode)
+    (js-mode)))
+
+(defun chief/jsts-tsx-major-mode ()
+  "Activate the preferred TSX major mode."
+  (interactive)
+  (cond
+   ((chief/jsts-treesit-ready-for-mode-p 'tsx 'tsx-ts-mode)
+    (tsx-ts-mode))
+   ((fboundp 'web-mode)
+    (web-mode))
+   (t
+    (js-mode))))
+
+(defun chief/jsts-json-major-mode ()
+  "Activate the preferred JSON major mode."
+  (interactive)
+  (cond
+   ((chief/jsts-treesit-ready-for-mode-p 'json 'json-ts-mode)
+    (json-ts-mode))
+   ((fboundp 'json-mode)
+    (json-mode))
+   ((fboundp 'js-json-mode)
+    (js-json-mode))
+   (t
+    (js-mode))))
+
+(defun chief/jsts-jsonc-major-mode ()
+  "Activate the preferred JSONC major mode."
+  (interactive)
+  (cond
+   ((fboundp 'jsonc-mode)
+    (jsonc-mode))
+   ((chief/jsts-treesit-ready-for-mode-p 'json 'json-ts-mode)
+    (json-ts-mode))
+   ((fboundp 'json-mode)
+    (json-mode))
+   ((fboundp 'js-json-mode)
+    (js-json-mode))
+   (t
+    (js-mode))))
+
+(defun chief/jsts-node-repl-command (&optional language)
+  "Return the Node.js REPL command for LANGUAGE."
+  (let ((language (or language (chief/jsts-buffer-kind))))
+    (if (memq language '(typescript tsx jsx))
+        (when-let* ((tsx (executable-find "tsx")))
+          (list tsx))
+      (when-let* ((node (executable-find "node")))
+        (list node)))))
+
+(defun chief/jsts-repl-command (&optional runtime language)
+  "Return the command list used to start a REPL for RUNTIME and LANGUAGE."
+  (let ((runtime (or runtime (chief/jsts-current-runtime)))
+        (language (or language (chief/jsts-buffer-kind))))
     (pcase runtime
       ('node
-       (if (chief/jsts-typescript-buffer-p)
-           (when-let* ((tsx (executable-find "tsx")))
-             (list tsx))
-         (when-let* ((node (executable-find "node")))
-           (list node))))
+       (chief/jsts-node-repl-command language))
       ('deno
        (when-let* ((deno (executable-find "deno")))
          (list deno "repl")))
@@ -177,18 +378,16 @@ When nil or `auto', this module detects the runtime from the project.")
 RUNTIME defaults to the current buffer runtime, LANGUAGE defaults to the
 current buffer language, and PARAMS optionally supplies Org header arguments."
   (let* ((runtime (or runtime (chief/jsts-current-runtime)))
-         (language (or language (if (chief/jsts-typescript-buffer-p)
-                                    'typescript
-                                  'javascript)))
+         (language (or language (chief/jsts-buffer-kind) (chief/jsts-buffer-language) 'javascript))
          (extra (chief/jsts-runtime-extra-arguments params)))
     (pcase runtime
       ('node
-       (when-let* ((node (executable-find "node")))
-         (append (list node)
-                 (when (eq language 'typescript)
-                   chief/jsts-node-typescript-file-args)
-                 extra
-                 (list file))))
+       (cond
+        ((memq language '(typescript tsx jsx))
+         (when-let* ((tsx (executable-find "tsx")))
+           (append (list tsx) extra (list file))))
+        ((when-let* ((node (executable-find "node")))
+           (append (list node) extra (list file))))))
       ('deno
        (when-let* ((deno (executable-find "deno")))
          (append (list deno "run")
@@ -201,23 +400,26 @@ current buffer language, and PARAMS optionally supplies Org header arguments."
                  extra
                  (list file))))
       ('quickjs
-       (when-let* ((qjs (executable-find chief/jsts-quickjs-command)))
-         (append (list qjs)
-                 extra
-                 (list file)))))))
+       (when (memq language '(javascript json jsonc))
+         (when-let* ((qjs (executable-find chief/jsts-quickjs-command)))
+           (append (list qjs)
+                   extra
+                   (list file))))))))
 
 (defun chief/jsts-language-extension (&optional language)
   "Return a suitable file extension for LANGUAGE."
-  (pcase language
-    ('typescript (if (derived-mode-p 'tsx-ts-mode) ".tsx" ".ts"))
+  (pcase (or language (chief/jsts-buffer-kind) (chief/jsts-buffer-language))
+    ('tsx ".tsx")
+    ('typescript ".ts")
+    ('jsx ".jsx")
+    ('jsonc ".jsonc")
+    ('json ".json")
     (_ ".js")))
 
 (defun chief/jsts-write-temp-file (body &optional language)
   "Write BODY to a temporary file for LANGUAGE and return the file path."
-  (let* ((language (or language (if (chief/jsts-typescript-buffer-p)
-                                    'typescript
-                                  'javascript)))
-         (root (chief/jsts-project-root))
+  (let* ((language (or language (chief/jsts-buffer-kind) (chief/jsts-buffer-language) 'javascript))
+         (root (chief/jsts-execution-root))
          (temporary-file-directory root)
          (file (make-temp-file
                 (expand-file-name "chief-jsts-" root)
@@ -230,7 +432,7 @@ current buffer language, and PARAMS optionally supplies Org header arguments."
 (defun chief/jsts-run-command (command &optional directory)
   "Run COMMAND from DIRECTORY and return its trimmed output.
 Signal an error when the command exits unsuccessfully."
-  (let ((default-directory (or directory (chief/jsts-project-root)))
+  (let ((default-directory (or directory (chief/jsts-execution-root)))
         (stdout (generate-new-buffer " *chief-jsts-stdout*"))
         (stderr-file (make-temp-file "chief-jsts-stderr-")))
     (unwind-protect
@@ -256,24 +458,40 @@ Signal an error when the command exits unsuccessfully."
 When FILE is nil, use the current buffer file or a temporary file.
 PARAMS optionally supplies Org Babel header arguments."
   (interactive)
-  (let* ((language (or language (if (chief/jsts-typescript-buffer-p)
-                                    'typescript
-                                  'javascript)))
-         (file (or file
-                   buffer-file-name
-                   (chief/jsts-write-temp-file (buffer-substring-no-properties
-                                                (point-min)
-                                                (point-max))
-                                               language))))
-    (unless-let* ((command (chief/jsts-script-command file runtime language params)))
-      (user-error "No executable is configured for the %s runtime" (chief/jsts-runtime-display-name runtime)))
-    (chief/jsts-run-command command (chief/jsts-project-root))))
+  (let* ((runtime (or runtime (chief/jsts-current-runtime)))
+         (language (or language (chief/jsts-buffer-kind) (chief/jsts-buffer-language) 'javascript))
+         (source-file (or file
+                          buffer-file-name
+                          (chief/jsts-write-temp-file (buffer-substring-no-properties
+                                                       (point-min)
+                                                       (point-max))
+                                                      language))))
+    (if (and (eq runtime 'quickjs)
+             (memq language '(typescript tsx jsx)))
+        (let ((transpiled-file nil))
+          (unwind-protect
+              (progn
+                (setq transpiled-file (chief/jsts-transpile-file-to-js source-file language))
+                (chief/jsts-run-command
+                 (append (list (or (executable-find chief/jsts-quickjs-command)
+                                   (user-error "QuickJS is not available on PATH")))
+                         (chief/jsts-runtime-extra-arguments params)
+                         (list transpiled-file))
+                 (chief/jsts-execution-root)))
+            (when (and transpiled-file (file-exists-p transpiled-file))
+              (delete-file transpiled-file))))
+      (let ((command (chief/jsts-script-command source-file runtime language params)))
+        (unless command
+          (user-error "No executable is configured for %s on the %s runtime"
+                      (chief/jsts-language-display-name language)
+                      (chief/jsts-runtime-display-name runtime)))
+        (chief/jsts-run-command command (chief/jsts-execution-root))))))
 
 (defun chief/jsts-describe-runtime ()
   "Display the current JS/TS runtime choice."
   (interactive)
   (message "%s runtime for this buffer: %s"
-           (if (chief/jsts-typescript-buffer-p) "TypeScript" "JavaScript")
+           (chief/jsts-language-display-name)
            (chief/jsts-runtime-display-name)))
 
 (defun chief/jsts-set-runtime (runtime)
@@ -295,24 +513,41 @@ PARAMS optionally supplies Org Babel header arguments."
     (lsp-workspace-restart))
   (message "Set this buffer's runtime to %s" (chief/jsts-runtime-display-name runtime)))
 
+(defun chief/jsts-project-label ()
+  "Return a human-readable project label for the current buffer."
+  (let* ((project-root (chief/jsts-project-root))
+         (execution-root (chief/jsts-execution-root))
+         (project-name (file-name-nondirectory
+                        (directory-file-name project-root)))
+         (relative (unless (equal execution-root project-root)
+                     (directory-file-name
+                      (file-relative-name execution-root project-root)))))
+    (if (and relative (not (string-empty-p relative)) (not (equal relative ".")))
+        (format "%s:%s" project-name relative)
+      project-name)))
+
 (defun chief/jsts-repl-buffer-name (&optional runtime)
   "Return the REPL buffer name for RUNTIME."
-  (let* ((runtime (or runtime (chief/jsts-current-runtime)))
-         (project (file-name-nondirectory
-                   (directory-file-name (chief/jsts-project-root)))))
+  (let ((runtime (or runtime (chief/jsts-current-runtime))))
     (format "*%s[%s:%s]*"
-            (if (chief/jsts-typescript-buffer-p) "ts" "js")
+            (pcase (chief/jsts-buffer-kind)
+              ((or 'typescript 'tsx) "ts")
+              (_ "js"))
             runtime
-            project)))
+            (chief/jsts-project-label))))
 
 (defun chief/jsts-unsupported-repl-message (&optional runtime)
   "Return the error message for an unsupported REPL under RUNTIME."
   (pcase (or runtime (chief/jsts-current-runtime))
     ('node
-     (if (chief/jsts-typescript-buffer-p)
-         "Node.js does not support TypeScript REPL input directly. Install `tsx` or use Bun/Deno for interactive TypeScript."
+     (if (memq (chief/jsts-buffer-kind) '(typescript tsx jsx))
+         "Node.js requires `tsx` on PATH for interactive TypeScript/JSX/TSX."
        "Node.js is not available on PATH"))
-    ('quickjs "QuickJS is not available on PATH")
+    ('quickjs
+     (if (and (memq (chief/jsts-buffer-kind) '(typescript tsx jsx))
+              (not (chief/jsts-esbuild-available-p)))
+         "QuickJS needs `esbuild` on PATH for interactive TypeScript/JSX/TSX."
+       "QuickJS is not available on PATH"))
     ('bun "Bun is not available on PATH")
     ('deno "Deno is not available on PATH")
     (_ "No JS/TS runtime is configured for this buffer")))
@@ -320,10 +555,11 @@ PARAMS optionally supplies Org Babel header arguments."
 (defun chief/jsts-ensure-repl-buffer ()
   "Return a live REPL buffer for the current JS/TS buffer."
   (let* ((runtime (chief/jsts-current-runtime))
+         (language (chief/jsts-buffer-kind))
          (buffer-name (chief/jsts-repl-buffer-name runtime))
          (buffer (get-buffer-create buffer-name))
-         (command (chief/jsts-repl-command runtime))
-         (default-directory (chief/jsts-project-root)))
+         (command (chief/jsts-repl-command runtime language))
+         (default-directory (chief/jsts-execution-root)))
     (unless command
       (user-error "%s" (chief/jsts-unsupported-repl-message runtime)))
     (unless (comint-check-proc buffer)
@@ -358,10 +594,16 @@ PARAMS optionally supplies Org Babel header arguments."
 
 (defun chief/jsts-send-string (string)
   "Send STRING to the current buffer's JS/TS REPL."
-  (let* ((buffer (chief/jsts-ensure-repl-buffer))
+  (let* ((runtime (chief/jsts-current-runtime))
+         (language (or (chief/jsts-buffer-kind) (chief/jsts-buffer-language) 'javascript))
+         (payload (if (and (eq runtime 'quickjs)
+                           (memq language '(typescript tsx jsx)))
+                      (chief/jsts-transpile-string-to-js string language)
+                    string))
+         (buffer (chief/jsts-ensure-repl-buffer))
          (process (get-buffer-process buffer)))
-    (comint-send-string process string)
-    (unless (string-suffix-p "\n" string)
+    (comint-send-string process payload)
+    (unless (string-suffix-p "\n" payload)
       (comint-send-string process "\n"))
     (display-buffer buffer)))
 
@@ -392,45 +634,108 @@ PARAMS optionally supplies Org Babel header arguments."
 
 (defun chief/jsts-configure-lsp ()
   "Configure per-project JS/TS LSP client selection."
-  (setq-local lsp-disabled-clients '(jsts-ls flow-ls))
-  (if (chief/jsts-deno-project-p)
-      (progn
-        (setq-local lsp-enabled-clients '(deno-ls))
-        (setq-local lsp-disabled-clients '(ts-ls jsts-ls flow-ls))
-        (when-let* ((config (chief/jsts-deno-config-file)))
-          (setq-local lsp-clients-deno-config config)))
-    (setq-local lsp-enabled-clients '(ts-ls))
-    (setq-local lsp-disabled-clients '(deno-ls jsts-ls flow-ls))))
+  (when (chief/jsts-code-buffer-p)
+    (setq-local lsp-disabled-clients '(jsts-ls flow-ls))
+    (if (chief/jsts-deno-project-p)
+        (progn
+          (setq-local lsp-enabled-clients '(deno-ls))
+          (setq-local lsp-disabled-clients '(ts-ls jsts-ls flow-ls))
+          (when-let* ((config (chief/jsts-deno-config-file)))
+            (setq-local lsp-clients-deno-config config)))
+      (setq-local lsp-enabled-clients '(ts-ls))
+      (setq-local lsp-disabled-clients '(deno-ls jsts-ls flow-ls)))))
+
+(defun chief/jsts-common-setup ()
+  "Configure shared workspace integration for JS/TS-related buffers."
+  (setq-local chief/lsp-root-function #'chief/jsts-project-root)
+  (when (boundp 'js-indent-level)
+    (setq-local js-indent-level 2))
+  (when (boundp 'typescript-ts-mode-indent-offset)
+    (setq-local typescript-ts-mode-indent-offset 2))
+  (when (boundp 'typescript-indent-level)
+    (setq-local typescript-indent-level 2))
+  (when (boundp 'web-mode-code-indent-offset)
+    (setq-local web-mode-code-indent-offset 2))
+  (when (boundp 'web-mode-markup-indent-offset)
+    (setq-local web-mode-markup-indent-offset 2))
+  (when (boundp 'web-mode-css-indent-offset)
+    (setq-local web-mode-css-indent-offset 2)))
+
+(defun chief/jsts-related-mode-setup ()
+  "Configure JSON and JSONC buffers related to JS/TS projects."
+  (chief/jsts-common-setup)
+  (chief/repl-configure)
+  (when (fboundp 'chief/lsp-managed-mode-setup)
+    (chief/lsp-managed-mode-setup)))
 
 (defun chief/jsts-mode-setup ()
   "Configure runtime, REPL, and LSP support for JS/TS buffers."
-  (setq-local js-indent-level 2)
-  (setq-local chief/lsp-root-function #'chief/jsts-project-root)
-  (when (boundp 'typescript-ts-mode-indent-offset)
-    (setq-local typescript-ts-mode-indent-offset 2))
-  (chief/repl-configure
-   :start #'chief/jsts-start-repl
-   :restart #'chief/jsts-restart-repl
-   :send-line #'chief/jsts-send-line
-   :send-region #'chief/jsts-send-region
-   :send-buffer #'chief/jsts-send-buffer
-   :load-file #'chief/jsts-load-file)
-  (chief/jsts-configure-lsp)
-  (when (fboundp 'chief/lsp-managed-mode-setup)
-    (chief/lsp-managed-mode-setup)))
+  (when (chief/jsts-code-buffer-p)
+    (chief/jsts-common-setup)
+    (chief/repl-configure
+     :start #'chief/jsts-start-repl
+     :restart #'chief/jsts-restart-repl
+     :send-line #'chief/jsts-send-line
+     :send-region #'chief/jsts-send-region
+     :send-buffer #'chief/jsts-send-buffer
+     :load-file #'chief/jsts-load-file)
+    (chief/jsts-configure-lsp)
+    (when (fboundp 'chief/lsp-managed-mode-setup)
+      (chief/lsp-managed-mode-setup))))
+
+(defun chief/jsts-web-mode-setup ()
+  "Configure `web-mode' buffers that actually contain JSX or TSX."
+  (when (chief/jsts-web-template-buffer-p)
+    (chief/jsts-mode-setup)))
+
+(defconst chief/jsts-auto-mode-alist
+  '(("\\.jsonc\\'" . chief/jsts-jsonc-major-mode)
+    ("\\.tsx\\'" . chief/jsts-tsx-major-mode)
+    ("\\.\\(?:d\\.\\)?\\(?:mts\\|cts\\|ts\\)\\'" . chief/jsts-typescript-major-mode)
+    ("\\.mjsx\\'" . chief/jsts-javascript-major-mode)
+    ("\\.jsx\\'" . chief/jsts-javascript-major-mode)
+    ("\\.mjs\\'" . chief/jsts-javascript-major-mode)
+    ("\\.cjs\\'" . chief/jsts-javascript-major-mode)
+    ("\\.js\\'" . chief/jsts-javascript-major-mode)
+    ("\\.json\\'" . chief/jsts-json-major-mode))
+  "Preferred auto-mode dispatch for JS/TS-related files.")
+
+(dolist (entry (reverse chief/jsts-auto-mode-alist))
+  (add-to-list 'auto-mode-alist entry))
 
 (with-eval-after-load 'lsp-mode
   (require 'lsp-javascript)
   (setq lsp-clients-typescript-prefer-use-project-ts-server t)
   (setq lsp-javascript-format-enable t)
-  (setq lsp-typescript-format-enable t))
+  (setq lsp-typescript-format-enable t)
+  (when-let* ((tsls (executable-find "typescript-language-server")))
+    (setq lsp-clients-typescript-tls-path tsls))
+  (when-let* ((npm (executable-find "npm")))
+    (setq lsp-clients-typescript-npm-location npm))
+  (dolist (entry '(("\\.mjs\\'" . "javascript")
+                   ("\\.cjs\\'" . "javascript")
+                   ("\\.mjsx\\'" . "javascriptreact")
+                   ("\\.mts\\'" . "typescript")
+                   ("\\.cts\\'" . "typescript")
+                   ("\\.d\\.ts\\'" . "typescript")
+                   ("\\.d\\.mts\\'" . "typescript")
+                   ("\\.d\\.cts\\'" . "typescript")))
+    (add-to-list 'lsp-language-id-configuration entry)))
 
 (add-hook 'js-mode-hook #'chief/jsts-mode-setup)
 (add-hook 'js-ts-mode-hook #'chief/jsts-mode-setup)
+(add-hook 'web-mode-hook #'chief/jsts-web-mode-setup)
 (when (fboundp 'typescript-ts-mode)
   (add-hook 'typescript-ts-mode-hook #'chief/jsts-mode-setup))
 (when (fboundp 'tsx-ts-mode)
   (add-hook 'tsx-ts-mode-hook #'chief/jsts-mode-setup))
+(add-hook 'js-json-mode-hook #'chief/jsts-related-mode-setup)
+(when (fboundp 'json-mode)
+  (add-hook 'json-mode-hook #'chief/jsts-related-mode-setup))
+(when (fboundp 'jsonc-mode)
+  (add-hook 'jsonc-mode-hook #'chief/jsts-related-mode-setup))
+(when (fboundp 'json-ts-mode)
+  (add-hook 'json-ts-mode-hook #'chief/jsts-related-mode-setup))
 
 (with-eval-after-load 'js
   (chief/repl-setup-standard-local-leader 'js-mode-map)
@@ -447,6 +752,15 @@ PARAMS optionally supplies Org Babel header arguments."
   (chief/repl-setup-standard-local-leader 'tsx-ts-mode-map)
   (chief/local-leader-def
     :keymaps '(typescript-ts-mode-map tsx-ts-mode-map)
+    "r" '(:ignore t :which-key "runtime")
+    "rr" #'chief/jsts-set-runtime
+    "ri" #'chief/jsts-describe-runtime
+    "rf" #'chief/jsts-run-file))
+
+(with-eval-after-load 'web-mode
+  (chief/repl-setup-standard-local-leader 'web-mode-map)
+  (chief/local-leader-def
+    :keymaps 'web-mode-map
     "r" '(:ignore t :which-key "runtime")
     "rr" #'chief/jsts-set-runtime
     "ri" #'chief/jsts-describe-runtime

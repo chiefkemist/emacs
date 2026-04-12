@@ -54,7 +54,9 @@ masquerade as the primary language server for a buffer.")
     java-ts-mode
     js-json-mode
     js-ts-mode
+    json-mode
     json-ts-mode
+    jsonc-mode
     kotlin-mode
     lua-mode
     lua-ts-mode
@@ -74,6 +76,7 @@ masquerade as the primary language server for a buffer.")
     sh-mode
     swift-mode
     tuareg-mode
+    typescript-mode
     typescript-ts-mode
     yaml-mode
     yaml-ts-mode
@@ -238,7 +241,17 @@ masquerade as the primary language server for a buffer.")
    ((derived-mode-p 'erlang-mode)
     (when (fboundp 'chief/erlang-project-root)
       (chief/erlang-project-root)))
-   ((derived-mode-p 'js-mode 'js-ts-mode 'typescript-ts-mode 'tsx-ts-mode 'mhtml-mode)
+   ((or (derived-mode-p 'js-mode)
+        (derived-mode-p 'js-ts-mode)
+        (eq major-mode 'typescript-mode)
+        (derived-mode-p 'typescript-ts-mode)
+        (derived-mode-p 'tsx-ts-mode)
+        (derived-mode-p 'mhtml-mode)
+        (derived-mode-p 'json-mode)
+        (derived-mode-p 'jsonc-mode)
+        (and (derived-mode-p 'web-mode)
+             (fboundp 'chief/jsts-web-template-buffer-p)
+             (chief/jsts-web-template-buffer-p)))
     (when (fboundp 'chief/jsts-project-root)
       (chief/jsts-project-root)))
    ((derived-mode-p 'kotlin-mode 'java-mode 'java-ts-mode)
@@ -307,6 +320,9 @@ prevents stale SDK/library session folders from winning over the project root."
 
 (defvar-local chief/lsp-definition-function nil
   "Buffer-local override used by `chief/goto-definition'.")
+
+(defvar-local chief/lsp-definition-other-window-function nil
+  "Buffer-local override used by `chief/find-definitions-other-window'.")
 
 (defvar-local chief/lsp-declaration-function nil
   "Buffer-local override used by `chief/goto-declaration'.")
@@ -553,32 +569,50 @@ match `lsp-show-xrefs'."
 (defun chief/find-definitions ()
   "Show definitions for the symbol at point."
   (interactive)
-  (if (chief/lsp-ensure-active-for-navigation)
-      (chief/lsp-show-location-list-async "textDocument/definition")
-    (user-error "No LSP definition backend is available here")))
+  (cond
+   ((chief/lsp-call-local-override chief/lsp-definition-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-definition-function)))
+   ((chief/lsp-ensure-active-for-navigation)
+    (chief/lsp-show-location-list-async "textDocument/definition"))
+   (t
+    (user-error "No definition backend is available here"))))
 
 (defun chief/find-definitions-other-window ()
   "Show definitions for the symbol at point in another window."
   (interactive)
-  (if (chief/lsp-ensure-active-for-navigation)
-      (chief/lsp-show-location-list-async "textDocument/definition" nil 'window)
-    (user-error "No LSP definition backend is available here")))
+  (cond
+   ((chief/lsp-call-local-override chief/lsp-definition-other-window-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-definition-other-window-function)))
+   ((chief/lsp-ensure-active-for-navigation)
+    (chief/lsp-show-location-list-async "textDocument/definition" nil 'window))
+   (t
+    (user-error "No definition backend is available here"))))
 
 (defun chief/find-references ()
   "Show references for the symbol at point."
   (interactive)
-  (if (chief/lsp-ensure-active-for-navigation)
-      (chief/lsp-show-location-list-async
-       "textDocument/references"
-       (list :context `(:includeDeclaration ,(lsp-json-bool (not lsp-references-exclude-declaration))))
-       nil
-       t)
-    (user-error "No LSP references backend is available here")))
+  (cond
+   ((chief/lsp-call-local-override chief/lsp-references-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-references-function)))
+   ((chief/lsp-ensure-active-for-navigation)
+    (chief/lsp-show-location-list-async
+     "textDocument/references"
+     (list :context `(:includeDeclaration ,(lsp-json-bool (not lsp-references-exclude-declaration))))
+     nil
+     t))
+   (t
+    (user-error "No references backend is available here"))))
 
 (defun chief/find-implementations ()
   "Show implementations for the symbol at point."
   (interactive)
   (cond
+   ((chief/lsp-call-local-override chief/lsp-implementation-function))
+   ((chief/lsp-call-local-override
+     (chief/lsp-mode-override 'chief/lsp-implementation-function)))
    ((chief/lsp-ensure-active-for-navigation)
     (chief/lsp-show-location-list-async
      "textDocument/implementation"
@@ -678,6 +712,23 @@ match `lsp-show-xrefs'."
     (call-interactively #'lsp-signature-activate))
    (t
     (user-error "No signature help backend is available here"))))
+
+(defun chief/insert-C-k-dwim ()
+  "Preserve structural editing on `C-k' in insert state.
+
+When structured editing is active, defer to it. Otherwise fall back to
+signature help. This avoids stomping on Paredit's default `C-k' binding in
+Lisp buffers while keeping the LSP shortcut elsewhere."
+  (interactive)
+  (cond
+   ((and (bound-and-true-p paredit-mode)
+         (fboundp 'paredit-kill))
+    (call-interactively #'paredit-kill))
+   ((and (bound-and-true-p smartparens-mode)
+         (fboundp 'sp-kill-hybrid-sexp))
+    (call-interactively #'sp-kill-hybrid-sexp))
+   (t
+    (call-interactively #'chief/show-signature-help))))
 
 (defun chief/lsp-current-workspaces ()
   "Return the live workspaces relevant to the current buffer."
@@ -779,7 +830,7 @@ METHOD is the corresponding LSP method like \"textDocument/inlayHint\"."
      "gK" #'chief/show-signature-help
      "K" #'chief/show-hover-doc))
   (evil-global-set-key 'insert (kbd "C-S-SPC") #'completion-at-point)
-  (evil-global-set-key 'insert (kbd "C-k") #'chief/show-signature-help))
+  (evil-global-set-key 'insert (kbd "C-k") #'chief/insert-C-k-dwim))
 
 (defun chief/lsp-ocamllsp-command ()
   "Return the command list for ocamllsp, preferring `dune tools which'."
@@ -1038,7 +1089,9 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
          (java-mode . chief/lsp-managed-mode-setup)
          (java-ts-mode . chief/lsp-managed-mode-setup)
          (js-json-mode . chief/lsp-managed-mode-setup)
+         (json-mode . chief/lsp-managed-mode-setup)
          (json-ts-mode . chief/lsp-managed-mode-setup)
+         (jsonc-mode . chief/lsp-managed-mode-setup)
          (kotlin-mode . chief/lsp-managed-mode-setup)
          (lua-mode . chief/lsp-managed-mode-setup)
          (lua-ts-mode . chief/lsp-managed-mode-setup)
@@ -1057,6 +1110,7 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
          (sh-mode . chief/lsp-managed-mode-setup)
          (swift-mode . chief/lsp-managed-mode-setup)
          (tuareg-mode . chief/lsp-managed-mode-setup)
+         (typescript-mode . chief/lsp-managed-mode-setup)
          (yaml-mode . chief/lsp-managed-mode-setup)
          (yaml-ts-mode . chief/lsp-managed-mode-setup))
   :custom

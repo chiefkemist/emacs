@@ -190,6 +190,10 @@
   :defer 1
   :config
   (setq treesit-auto-install nil)
+  ;; The current markdown tree-sitter grammar is crashing this Emacs build on
+  ;; macOS inside `treesit--pre-redisplay', so keep Markdown on the classic
+  ;; major mode for stability.
+  (setq treesit-auto-langs (delete 'markdown treesit-auto-langs))
   (global-treesit-auto-mode 1)
   (add-hook 'find-file-hook #'chief/treesit-maybe-offer-install))
 

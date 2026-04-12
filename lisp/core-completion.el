@@ -180,46 +180,8 @@
   :after (embark consult)
   :hook (embark-collect-mode . consult-preview-at-point-mode))
 
-(use-package corfu
-  :straight (:files (:defaults "extensions/*.el"))
-  :demand t
-  :custom
-  (corfu-auto t)
-  (corfu-auto-prefix 2)
-  (corfu-auto-delay 0.12)
-  (corfu-cycle t)
-  (corfu-preselect 'prompt)
-  (corfu-preview-current nil)
-  (corfu-quit-no-match 'separator)
-  :bind
-  (:map corfu-map
-        ("C-n" . corfu-next)
-        ("C-p" . corfu-previous)
-        ("C-y" . corfu-insert)
-        ("C-SPC" . corfu-complete)
-        ("<tab>" . corfu-next)
-        ("TAB" . corfu-next)
-        ("S-TAB" . corfu-previous)
-        ("<backtab>" . corfu-previous))
-  :init
-  (global-corfu-mode 1))
-
-(use-package corfu-history
-  :straight nil
-  :after corfu
-  :init
-  (corfu-history-mode 1)
-  :custom
-  (savehist-additional-variables
-   (append savehist-additional-variables '(corfu-history))))
-
-(use-package corfu-popupinfo
-  :straight nil
-  :after corfu
-  :custom
-  (corfu-popupinfo-delay '(0.25 . 0.15))
-  :init
-  (corfu-popupinfo-mode 1))
+;; Use Emacs' built-in `completion-at-point` UI directly.
+;; This keeps LSP/Cape-powered completion working without Corfu's popup frames.
 
 (use-package yasnippet
   :commands (yas-minor-mode yas-insert-snippet yas-next-field-or-maybe-expand yas-prev-field)
@@ -237,18 +199,8 @@
   (when (fboundp 'yasnippet-snippets-initialize)
     (yasnippet-snippets-initialize)))
 
-(use-package kind-icon
-  :if (display-graphic-p)
-  :after corfu
-  :custom
-  (kind-icon-default-face 'corfu-default)
-  (kind-icon-use-icons nil)
-  :config
-  (add-to-list 'corfu-margin-formatters #'kind-icon-margin-formatter))
-
 (use-package cape
   :demand t
-  :after corfu
   :config
   (add-to-list 'completion-at-point-functions #'cape-file)
   (add-to-list 'completion-at-point-functions #'cape-dabbrev)
