@@ -32,6 +32,14 @@
                     chief/theme-preferences)
         available)))
 
+(defun chief/theme-apply-face-fixes ()
+  "Apply compatibility face overrides after theme loads.
+This avoids a known Gnus face inheritance cycle exposed when packages such as
+`templ-ts-mode' require `css-mode', which pulls in `eww' and `gnus'."
+  (custom-theme-set-faces
+   'user
+   '(gnus-group-news-low-empty ((t (:inherit gnus-group-mail-1-empty :weight normal))))))
+
 (defun chief/load-theme (theme)
   "Disable active themes and load THEME."
   (interactive
@@ -49,7 +57,8 @@
     (unless target
       (user-error "No themes are currently available"))
     (mapc #'disable-theme custom-enabled-themes)
-    (load-theme target t)))
+    (load-theme target t)
+    (chief/theme-apply-face-fixes)))
 
 (defun chief/cycle-theme ()
   "Cycle through `chief/theme-preferences'."
