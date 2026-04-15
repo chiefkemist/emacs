@@ -90,6 +90,29 @@
     (list (format "JAVA_HOME=%s" home)
           (format "JDK_HOME=%s" home))))
 
+(defun chief/jvm-activate-environment ()
+  "Deterministically prefer the configured JVM inside Emacs.
+
+This makes Emacs prefer SDKMAN-managed Java first, instead of relying on
+whatever JAVA_HOME or PATH happened to be inherited at startup."
+  (interactive)
+  (when-let* ((home (chief/jvm-java-home))
+              (bin (expand-file-name "bin" home)))
+    (setenv "JAVA_HOME" home)
+    (setenv "JDK_HOME" home)
+    (when (file-directory-p bin)
+      (setq exec-path (cons bin (delete bin exec-path)))
+      (setenv
+       "PATH"
+       (string-join
+        (cons bin
+              (delete bin
+                      (split-string (or (getenv "PATH") "") path-separator t)))
+        path-separator)))
+    (when (called-interactively-p 'interactive)
+      (message "JVM environment activated: %s" home))
+    home))
+
 (defun chief/jvm-wrap-command (command)
   "Return COMMAND wrapped with JVM environment variables when available."
   (append (when-let* ((env-vars (chief/jvm-env-vars)))
@@ -99,6 +122,8 @@
 (defun chief/jvm-command-string (command)
   "Return a shell-safe command string for COMMAND."
   (mapconcat #'shell-quote-argument (chief/jvm-wrap-command command) " "))
+
+(chief/jvm-activate-environment)
 
 (defun chief/jvm-register-external-root (file root)
   "Remember that FILE should use JVM project ROOT."

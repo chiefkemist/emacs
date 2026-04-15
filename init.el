@@ -19,6 +19,19 @@
 (add-to-list 'warning-suppress-types '(files missing-lexbind-cookie))
 (add-to-list 'warning-suppress-log-types '(files missing-lexbind-cookie))
 
+(put 'vc-follow-symlinks 'safe-local-variable
+     (lambda (value)
+       (memq value '(t nil ask))))
+(put 'cider-clojure-cli-aliases 'safe-local-variable #'stringp)
+(put 'cider-custom-cljs-repl-init-form 'safe-local-variable #'stringp)
+(put 'cider-jack-in-nrepl-middlewares 'safe-local-variable
+     (lambda (value)
+       (and (listp value)
+            (catch 'invalid
+              (dolist (item value t)
+                (unless (stringp item)
+                  (throw 'invalid nil)))))))
+
 (setq custom-file (expand-file-name "custom.el" chief/etc-directory))
 
 (defvar chief/reloading-config nil
