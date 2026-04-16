@@ -32,13 +32,16 @@
                     chief/theme-preferences)
         available)))
 
-(defun chief/theme-apply-face-fixes ()
+(defun chief/theme-apply-face-fixes (&optional frame)
   "Apply compatibility face overrides after theme loads.
 This avoids a known Gnus face inheritance cycle exposed when packages such as
 `templ-ts-mode' require `css-mode', which pulls in `eww' and `gnus'."
-  (custom-theme-set-faces
-   'user
-   '(gnus-group-news-low-empty ((t (:inherit gnus-group-mail-1-empty :weight normal))))))
+  (with-selected-frame (or frame (selected-frame))
+    (ignore-errors
+      (set-face-attribute 'gnus-group-mail-1-empty nil :inherit 'default)
+      (set-face-attribute 'gnus-group-mail-1 nil :inherit 'gnus-group-mail-1-empty :weight 'bold)
+      (set-face-attribute 'gnus-group-news-low-empty nil :inherit 'gnus-group-mail-1-empty :weight 'normal)
+      (set-face-attribute 'gnus-group-news-low nil :inherit 'gnus-group-news-low-empty :weight 'bold))))
 
 (defun chief/load-theme (theme)
   "Disable active themes and load THEME."
@@ -147,6 +150,8 @@ This avoids a known Gnus face inheritance cycle exposed when packages such as
 (chief/safe-use-package modus-themes
   :straight nil
   :defer t)
+
+(add-hook 'after-make-frame-functions #'chief/theme-apply-face-fixes)
 
 (chief/load-theme chief/default-theme)
 

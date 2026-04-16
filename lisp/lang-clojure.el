@@ -2,6 +2,7 @@
 
 (require 'cl-lib)
 (require 'lang-java)
+(require 'seq)
 (require 'subr-x)
 
 (defcustom chief/babashka-command "bb"
@@ -202,6 +203,43 @@ REPL-KIND should be one of `clj', `cljs', or `clj&cljs'."
   (let ((default-directory (chief/cider-buffer-project-directory)))
     (apply orig-fn args)))
 
+(defun chief/cider--clean-ns-list (namespaces)
+  "Normalize NAMESPACES, removing nil and empty entries."
+  (sort (seq-remove #'string-empty-p
+                    (delq nil (copy-sequence namespaces)))
+        #'string<))
+
+(defun chief/cider-cached-ns-list (&optional repl)
+  "Return namespace names cached in REPL, filtering out nils."
+  (when-let* ((repl (or repl (cider-current-repl 'infer nil)))
+              (cache (buffer-local-value 'cider-repl-ns-cache repl)))
+    (chief/cider--clean-ns-list (nrepl-dict-keys cache))))
+
+(defun chief/cider-discard-ns-list-error-buffer ()
+  "Kill the transient `*cider-error*' buffer for suppressed `ns-list' failures."
+  (when-let* ((buf (get-buffer "*cider-error*")))
+    (with-current-buffer buf
+      (when (save-excursion
+              (goto-char (point-min))
+              (re-search-forward "ns-list-error" nil t))
+        (kill-buffer buf)))))
+
+(defun chief/cider-safe-ns-list-a (orig-fn &rest args)
+  "Avoid noisy cljs `ns-list' middleware failures.
+
+Some cljs sessions can return `ns-list-error' due to upstream middleware
+bugs. In that case, suppress the popup stacktrace and fall back to any cached
+namespace list so opening buffers does not blow up the UI."
+  (let ((cider-show-error-buffer nil)
+        (cider-auto-select-error-buffer nil))
+    (or (condition-case nil
+            (let ((result (apply orig-fn args)))
+              (chief/cider--clean-ns-list result))
+          (error nil))
+        (prog1 (chief/cider-cached-ns-list)
+          (chief/cider-discard-ns-list-error-buffer))
+        '())))
+
 (defun chief/cider-jack-in-clj-dwim (&optional prefix)
   "Start the best Clojure CIDER session for the current buffer."
   (interactive "P")
@@ -280,6 +318,10 @@ REPL-KIND should be one of `clj', `cljs', or `clj&cljs'."
 (defun chief/clojure-mode-setup ()
   "Configure REPL integration for Clojure-family buffers."
   (chief/clojure-cider-apply-context)
+  (setq-local chief/lsp-root-function
+              (lambda ()
+                (or (chief/clojure-polylith-workspace-root)
+                    (chief/clojure-cider-project-dir))))
   (chief/repl-configure
    :start #'chief/cider-jack-in-dwim
    :restart #'chief/cider-restart-dwim
@@ -339,6 +381,8 @@ REPL-KIND should be one of `clj', `cljs', or `clj&cljs'."
                      cider-pprint-eval-last-sexp
                      cider-pprint-eval-defun-at-point))
     (advice-add command :around #'chief/cider-with-buffer-project-dir-a))
+  (advice-add 'cider-sync-request:ns-list :around #'chief/cider-safe-ns-list-a)
+  (add-to-list 'cider-stacktrace-suppressed-errors "ns-list-error")
   (define-key cider-mode-map (kbd "C-c C-l") #'cider-load-buffer)
   (define-key cider-mode-map (kbd "C-c C-k") #'cider-load-buffer)
   (define-key cider-mode-map (kbd "C-x C-e") #'cider-eval-last-sexp)
