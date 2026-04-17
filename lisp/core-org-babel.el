@@ -85,16 +85,13 @@
     (user-error "lang-jsts.el is not loaded"))
   (let* ((runtime (chief/org-babel-jsts-runtime params))
          (extension (pcase language
+                      ('tsx ".tsx")
                       ('typescript ".ts")
                       (_ ".js")))
          (file (chief/org-babel-write-temp-file body extension params "chief-org-jsts-")))
     (unwind-protect
         (chief/org-babel-format-result
-         (chief/org-babel-run-command
-          (or (chief/jsts-script-command file runtime language params)
-              (user-error "No %s runtime is available for Org Babel"
-                          (capitalize (symbol-name runtime))))
-          params)
+         (chief/jsts-run-file file runtime language params)
          params)
       (when (file-exists-p file)
         (delete-file file)))))
@@ -180,6 +177,10 @@ EXTENSION is the temp file extension and COMMAND-FORM must return a command list
 (defalias 'org-babel-execute:ts
   (lambda (body params)
     (chief/org-babel-execute-jsts body params 'typescript)))
+
+(defalias 'org-babel-execute:tsx
+  (lambda (body params)
+    (chief/org-babel-execute-jsts body params 'tsx)))
 
 (chief/org-babel-define-command-backend swift ".swift"
   (list (or (executable-find "swift")

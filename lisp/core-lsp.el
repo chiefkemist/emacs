@@ -54,7 +54,9 @@ masquerade as the primary language server for a buffer.")
     java-ts-mode
     js-json-mode
     js-ts-mode
+    json-mode
     json-ts-mode
+    jsonc-mode
     kotlin-mode
     lua-mode
     lua-ts-mode
@@ -74,6 +76,7 @@ masquerade as the primary language server for a buffer.")
     sh-mode
     swift-mode
     tuareg-mode
+    typescript-mode
     typescript-ts-mode
     yaml-mode
     yaml-ts-mode
@@ -238,7 +241,17 @@ masquerade as the primary language server for a buffer.")
    ((derived-mode-p 'erlang-mode)
     (when (fboundp 'chief/erlang-project-root)
       (chief/erlang-project-root)))
-   ((derived-mode-p 'js-mode 'js-ts-mode 'typescript-ts-mode 'tsx-ts-mode 'mhtml-mode)
+   ((or (derived-mode-p 'js-mode)
+        (derived-mode-p 'js-ts-mode)
+        (eq major-mode 'typescript-mode)
+        (derived-mode-p 'typescript-ts-mode)
+        (derived-mode-p 'tsx-ts-mode)
+        (derived-mode-p 'mhtml-mode)
+        (derived-mode-p 'json-mode)
+        (derived-mode-p 'jsonc-mode)
+        (and (derived-mode-p 'web-mode)
+             (fboundp 'chief/jsts-web-template-buffer-p)
+             (chief/jsts-web-template-buffer-p)))
     (when (fboundp 'chief/jsts-project-root)
       (chief/jsts-project-root)))
    ((derived-mode-p 'kotlin-mode 'java-mode 'java-ts-mode)
@@ -1038,7 +1051,9 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
          (java-mode . chief/lsp-managed-mode-setup)
          (java-ts-mode . chief/lsp-managed-mode-setup)
          (js-json-mode . chief/lsp-managed-mode-setup)
+         (json-mode . chief/lsp-managed-mode-setup)
          (json-ts-mode . chief/lsp-managed-mode-setup)
+         (jsonc-mode . chief/lsp-managed-mode-setup)
          (kotlin-mode . chief/lsp-managed-mode-setup)
          (lua-mode . chief/lsp-managed-mode-setup)
          (lua-ts-mode . chief/lsp-managed-mode-setup)
@@ -1057,6 +1072,7 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
          (sh-mode . chief/lsp-managed-mode-setup)
          (swift-mode . chief/lsp-managed-mode-setup)
          (tuareg-mode . chief/lsp-managed-mode-setup)
+         (typescript-mode . chief/lsp-managed-mode-setup)
          (yaml-mode . chief/lsp-managed-mode-setup)
          (yaml-ts-mode . chief/lsp-managed-mode-setup))
   :custom
