@@ -2,9 +2,22 @@
 
 (require 'seq)
 
+(defvar chief/theme-directory
+  (expand-file-name "themes/" user-emacs-directory)
+  "Directory containing local custom themes.")
+
+(defun chief/ensure-theme-load-path ()
+  "Ensure local custom themes are discoverable."
+  (when (file-directory-p chief/theme-directory)
+    (add-to-list 'custom-theme-load-path chief/theme-directory)))
+
+(chief/ensure-theme-load-path)
+
 (defvar chief/default-theme 'doom-tokyo-night)
 (defvar chief/theme-preferences
   '(doom-tokyo-night
+    vercel-dark
+    vercel-light
     kanagawa-wave
     gruvbox-dark-medium
     gruber-darker
@@ -27,10 +40,31 @@
 
 (defun chief/ordered-themes ()
   "Return preferred themes in the order they are available."
+  (chief/ensure-theme-load-path)
   (let ((available (custom-available-themes)))
     (or (seq-filter (lambda (theme) (memq theme available))
                     chief/theme-preferences)
         available)))
+
+(defun chief/local-theme-file (theme)
+  "Return local source file for THEME, when it exists."
+  (let ((file (expand-file-name
+               (format "%s-theme.el" (symbol-name theme))
+               chief/theme-directory)))
+    (when (file-readable-p file)
+      file)))
+
+(defun chief/load-local-theme-source-around (orig theme &optional no-confirm no-enable)
+  "Load local THEME source files freshly before enabling them."
+  (if-let* ((local-file (chief/local-theme-file theme)))
+      (progn
+        (load-file local-file)
+        (unless no-enable
+          (enable-theme theme))
+        t)
+    (funcall orig theme no-confirm no-enable)))
+
+(advice-add 'load-theme :around #'chief/load-local-theme-source-around)
 
 (defun chief/theme-apply-face-fixes (&optional frame)
   "Apply compatibility face overrides after theme loads.
@@ -46,22 +80,39 @@ This avoids a known Gnus face inheritance cycle exposed when packages such as
 (defun chief/load-theme (theme)
   "Disable active themes and load THEME."
   (interactive
-   (list
-    (intern
-     (completing-read
-      "Load theme: "
-      (mapcar #'symbol-name (custom-available-themes))
-      nil
-      t))))
+   (progn
+     (chief/ensure-theme-load-path)
+     (list
+      (intern
+       (completing-read
+        "Load theme: "
+        (mapcar #'symbol-name (custom-available-themes))
+        nil
+        t)))))
+  (chief/ensure-theme-load-path)
   (let* ((available (custom-available-themes))
-         (target (if (memq theme available)
-                     theme
-                   (car (chief/ordered-themes)))))
+         (target (cond
+                  ((memq theme available) theme)
+                  ((eq theme chief/default-theme) (car (chief/ordered-themes)))
+                  (t (user-error "Theme is not available: %s" theme)))))
     (unless target
       (user-error "No themes are currently available"))
     (mapc #'disable-theme custom-enabled-themes)
-    (load-theme target t)
-    (chief/theme-apply-face-fixes)))
+    (if-let* ((local-file (chief/local-theme-file target)))
+        (progn
+          ;; `consult-theme' and `load-theme' may reuse an already-loaded Custom
+          ;; theme definition.  Local themes are under active development, so load
+          ;; their source file directly and then enable the freshly evaluated
+          ;; theme settings.
+          (load-file local-file)
+          (enable-theme target))
+      (unless (load-theme target t)
+        (user-error "Failed to load theme: %s" target)))
+    (chief/theme-apply-face-fixes)
+    (message "Theme: %s bg=%s fg=%s"
+             target
+             (face-background 'default nil t)
+             (face-foreground 'default nil t))))
 
 (defun chief/cycle-theme ()
   "Cycle through `chief/theme-preferences'."
@@ -76,6 +127,7 @@ This avoids a known Gnus face inheritance cycle exposed when packages such as
 (defun chief/theme-status ()
   "Report configured themes that are available versus still missing."
   (interactive)
+  (chief/ensure-theme-load-path)
   (let* ((available (custom-available-themes))
          (present (seq-filter (lambda (theme) (memq theme available))
                               chief/theme-preferences))
@@ -157,7 +209,8 @@ This avoids a known Gnus face inheritance cycle exposed when packages such as
 
 (chief/leader-def
   "t" '(:ignore t :which-key "toggles")
-  "tt" #'consult-theme
+  "tt" #'chief/load-theme
+  "tT" #'consult-theme
   "tc" #'chief/cycle-theme
   "ts" #'chief/theme-status)
 
