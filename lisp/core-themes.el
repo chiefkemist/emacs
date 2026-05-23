@@ -18,6 +18,8 @@
   '(doom-tokyo-night
     vercel-dark
     vercel-light
+    blue
+    darkblue
     kanagawa-wave
     gruvbox-dark-medium
     gruber-darker
