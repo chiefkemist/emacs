@@ -912,12 +912,40 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
       (find-file manifest)
     (user-error "No Cargo.toml found for this buffer")))
 
+(defun chief/rust-completion-setup ()
+  "Enable Rust popup completion, including zero-prefix trigger completions.
+Rust completions often start after trigger characters such as `::' or `.'.  At
+that point the textual prefix can be empty, so Rust buffers need a zero Corfu
+auto-prefix to pop up module/member completions immediately."
+  (when (boundp 'corfu-auto)
+    (setq-local corfu-auto t))
+  (when (boundp 'corfu-auto-delay)
+    (setq-local corfu-auto-delay 0.05))
+  (when (boundp 'corfu-auto-prefix)
+    (setq-local corfu-auto-prefix 0))
+  (when (fboundp 'corfu-mode)
+    ;; Re-enable locally so Corfu installs `corfu-auto--post-command' using the
+    ;; Rust-local zero-prefix settings above.  This fixes existing buffers after
+    ;; config reloads as well as newly opened Rust buffers.
+    (when (bound-and-true-p corfu-mode)
+      (corfu-mode -1))
+    (corfu-mode 1))
+  (when (fboundp 'lsp-completion-mode)
+    (lsp-completion-mode 1)))
+
 (defun chief/rust-mode-setup ()
   "Configure Rust buffers."
   (setq-local compile-command "cargo test")
   (setq-local chief/lsp-root-function #'chief/rust-project-root)
   (setq-local lsp-enabled-clients '(rust-analyzer))
+  (setq-local lsp-completion-enable t)
+  (setq-local lsp-completion-enable-additional-text-edit t)
+  (chief/rust-completion-setup)
   (when (require 'lsp-rust nil t)
+    (setq-local lsp-rust-analyzer-completion-auto-import-enable t)
+    (setq-local lsp-rust-analyzer-completion-auto-self-enable t)
+    (setq-local lsp-rust-analyzer-import-prefix "plain")
+    (setq-local lsp-rust-analyzer-import-granularity "crate")
     (if-let* ((command (and (fboundp 'chief/lsp-rust-analyzer-command)
                             (chief/lsp-rust-analyzer-command))))
         (progn

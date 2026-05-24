@@ -1167,6 +1167,10 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
   (require 'lsp-rust)
   (require 'lsp-yaml)
   (require 'lsp-completion)
+  ;; Doom's Corfu integration keeps `lsp-completion-provider' at :none, but
+  ;; still explicitly enables `lsp-completion-mode' so CAPF receives LSP
+  ;; candidates and completion-side edits such as rust-analyzer auto-imports.
+  (add-hook 'lsp-mode-hook #'lsp-completion-mode)
   (dolist (directory '("[/\\\\]\\.git\\'"
                        "[/\\\\]\\.direnv\\'"
                        "[/\\\\]\\.venv\\'"

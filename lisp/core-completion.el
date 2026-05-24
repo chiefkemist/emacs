@@ -180,8 +180,43 @@
   :after (embark consult)
   :hook (embark-collect-mode . consult-preview-at-point-mode))
 
-;; Use Emacs' built-in `completion-at-point` UI directly.
-;; This keeps LSP/Cape-powered completion working without Corfu's popup frames.
+;; Show `completion-at-point' candidates automatically.  LSP clients (including
+;; rust-analyzer) expose their completions as CAPF backends, and Corfu provides
+;; the popup UI while still letting `lsp-completion' apply completion-side edits
+;; such as Rust auto-imports.
+(use-package corfu
+  :demand t
+  :bind (:map corfu-map
+              ("TAB" . corfu-next)
+              ([tab] . corfu-next)
+              ("S-TAB" . corfu-previous)
+              ([backtab] . corfu-previous)
+              ("RET" . corfu-insert))
+  :init
+  ;; Set these before enabling `global-corfu-mode'.  `corfu-mode' installs its
+  ;; auto-completion post-command hook only when `corfu-auto' is already non-nil.
+  (setq corfu-auto t
+        corfu-auto-delay 0.15
+        corfu-auto-prefix 1
+        corfu-cycle t
+        corfu-count 16
+        corfu-max-width 120
+        corfu-preselect 'prompt
+        corfu-preview-current nil
+        corfu-quit-at-boundary 'separator
+        corfu-quit-no-match 'separator
+        corfu-on-exact-match nil)
+  (global-corfu-mode 1)
+  :config
+  ;; Doom lets the active completion style handle LSP CAPF candidates when Corfu
+  ;; is the UI, while `lsp-completion-mode' still applies completion text edits
+  ;; such as rust-analyzer auto-imports.
+  (add-to-list 'completion-category-overrides
+               `(lsp-capf (styles ,@completion-styles)))
+  (when (fboundp 'corfu-popupinfo-mode)
+    (corfu-popupinfo-mode 1))
+  (when (boundp 'corfu-popupinfo-delay)
+    (setq corfu-popupinfo-delay '(0.35 . 0.15))))
 
 (use-package yasnippet
   :commands (yas-minor-mode yas-insert-snippet yas-next-field-or-maybe-expand yas-prev-field)
@@ -201,10 +236,21 @@
 
 (use-package cape
   :demand t
+  :init
+  ;; Match Doom's CAPF layering: LSP owns language-aware completion; Cape is a
+  ;; local fallback, not a global competitor ahead of LSP.
+  (add-hook 'prog-mode-hook
+            (lambda ()
+              (add-hook 'completion-at-point-functions #'cape-file -10 t)
+              (add-hook 'completion-at-point-functions #'cape-dabbrev 20 t)
+              (add-hook 'completion-at-point-functions #'cape-keyword 30 t)))
   :config
-  (add-to-list 'completion-at-point-functions #'cape-file)
-  (add-to-list 'completion-at-point-functions #'cape-dabbrev)
-  (add-to-list 'completion-at-point-functions #'cape-keyword))
+  ;; Doom makes LSP CAPF composable/non-blocking with Corfu/Cape.  This preserves
+  ;; rust-analyzer completion items while allowing normal fallbacks when the
+  ;; server has no candidates.
+  (with-eval-after-load 'lsp-completion
+    (advice-add #'lsp-completion-at-point :around #'cape-wrap-noninterruptible)
+    (advice-add #'lsp-completion-at-point :around #'cape-wrap-nonexclusive)))
 
 (use-package consult-lsp
   :after (consult lsp-mode)
