@@ -64,10 +64,12 @@
         lang-jsts
         lang-java
         lang-kotlin
+        lang-nim
         lang-nushell
         lang-python
         lang-polyglot
         lang-rust
+        lang-lean
         lang-zig
         core-org-babel))
 
