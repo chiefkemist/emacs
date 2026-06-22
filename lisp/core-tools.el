@@ -15,6 +15,62 @@
 (use-package xterm-color
   :defer t)
 
+(defun chief/avy-goto-word-0 ()
+  "Jump to a visible word start immediately with Avy."
+  (interactive)
+  (call-interactively #'avy-goto-word-0))
+
+(defun chief/avy-goto-char-timer ()
+  "Jump with `avy-goto-char-timer' without Evil command remapping."
+  (interactive)
+  (call-interactively #'avy-goto-char-timer))
+
+(defun chief/avy-goto-char-2 ()
+  "Jump with `avy-goto-char-2' without Evil command remapping."
+  (interactive)
+  (call-interactively #'avy-goto-char-2))
+
+(defun chief/avy-goto-line ()
+  "Jump with `avy-goto-line' without Evil command remapping."
+  (interactive)
+  (call-interactively #'avy-goto-line))
+
+(defun chief/avy-goto-word-1 ()
+  "Jump with `avy-goto-word-1' without Evil command remapping."
+  (interactive)
+  (call-interactively #'avy-goto-word-1))
+
+(defun chief/avy-goto-symbol-1 ()
+  "Jump with `avy-goto-symbol-1' without Evil command remapping."
+  (interactive)
+  (call-interactively #'avy-goto-symbol-1))
+
+(use-package avy
+  :demand t
+  :bind (("M-g j" . chief/avy-goto-word-0)
+         ("M-g l" . chief/avy-goto-line)
+         ("M-g w" . chief/avy-goto-word-1)
+         :map isearch-mode-map
+         ("M-j" . avy-isearch))
+  :init
+  (chief/leader-def
+    "j" '(:ignore t :which-key "jump")
+    ;; Immediate jump that does not enter Avy's character-read prompt.
+    "jj" #'chief/avy-goto-word-0
+    "jc" #'chief/avy-goto-char-timer
+    "jC" #'chief/avy-goto-char-2
+    "jl" #'chief/avy-goto-line
+    "jw" #'chief/avy-goto-word-1
+    "js" #'chief/avy-goto-symbol-1)
+  :config
+  (setq avy-all-windows t
+        avy-background t
+        avy-timeout-seconds 0.35
+        avy-style 'at-full
+        avy-keys '(?a ?s ?d ?f ?g ?h ?j ?k ?l
+                   ?q ?w ?e ?r ?t ?y ?u ?i ?o ?p
+                   ?z ?x ?c ?v ?b ?n ?m)))
+
 (defcustom chief/magit-delta-executable "delta"
   "Executable used for delta-powered Git diff views."
   :type 'string

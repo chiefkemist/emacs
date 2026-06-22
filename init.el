@@ -68,6 +68,7 @@
         lang-nushell
         lang-python
         lang-polyglot
+        lang-dotnet
         lang-rust
         lang-lean
         lang-zig

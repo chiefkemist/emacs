@@ -50,6 +50,11 @@
   (general-define-key
    :states '(normal)
    "gcc" #'chief/evil-comment-dwim)
+  ;; Match this config's C-s Consult search UI in Evil command states.
+  ;; Evil normally uses C-r for redo, but redo remains available as :redo.
+  (general-define-key
+   :states '(normal visual motion)
+   "C-r" #'chief/consult-line-backward)
   (general-define-key
    :keymaps 'override
    "<escape>" #'keyboard-escape-quit)

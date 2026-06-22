@@ -58,6 +58,21 @@
           (org-babel-read result)
         (error result)))))
 
+(defun chief/org-babel-detangle-from-source-directory (orig &rest args)
+  "Run ORIG with relative tangle links resolved from the tangled file directory.
+`org-babel-detangle' follows file links embedded in tangled source comments.
+Those links are written relative to the tangled file, but some project modes set
+`default-directory' to the project root.  Bind it back to `buffer-file-name' so
+Detangle can find the original Org buffer reliably."
+  (let ((default-directory (or (and buffer-file-name
+                                    (file-name-directory buffer-file-name))
+                               default-directory)))
+    (apply orig args)))
+
+(with-eval-after-load 'ob-tangle
+  (advice-add 'org-babel-tangle-jump-to-org
+              :around #'chief/org-babel-detangle-from-source-directory))
+
 (defun chief/org-babel-execute-command-language (body params extension builder)
   "Execute BODY according to PARAMS using EXTENSION and command BUILDER."
   (let ((file (chief/org-babel-write-temp-file body extension params "chief-org-")))
@@ -187,28 +202,7 @@ EXTENSION is the temp file extension and COMMAND-FORM must return a command list
             (user-error "Swift is not available on PATH"))
         file))
 
-(defun org-babel-execute:rust (body params)
-  "Execute a Rust source block with Org Babel."
-  (let* ((file (chief/org-babel-write-temp-file body ".rs" params "chief-org-rust-"))
-         (binary (make-temp-file (expand-file-name "chief-org-rust-bin-" (chief/org-babel-execution-directory params)))))
-    (unwind-protect
-        (progn
-          (when (file-exists-p binary)
-            (delete-file binary))
-          (chief/org-babel-run-command
-           (list (or (executable-find "rustc")
-                     (user-error "rustc is not available on PATH"))
-                 file
-                 "-o"
-                 binary)
-           params)
-          (chief/org-babel-format-result
-           (chief/org-babel-run-command (list binary) params)
-           params))
-      (when (file-exists-p file)
-        (delete-file file))
-      (when (file-exists-p binary)
-        (delete-file binary)))))
+(require 'ob-rust-script)
 
 (chief/org-babel-define-command-backend go ".go"
   (list (or (executable-find "go")

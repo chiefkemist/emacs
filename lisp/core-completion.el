@@ -14,6 +14,40 @@
   (interactive)
   (call-interactively #'consult-line))
 
+(defun chief/consult--line-candidates-backward (curr-line)
+  "Return `consult-line' candidates, ordered backward from CURR-LINE."
+  (let (before after)
+    (dolist (candidate (consult--line-candidates t curr-line))
+      (pcase-let ((`(,_position . ,line)
+                   (get-text-property 0 'consult-location candidate)))
+        (if (<= line curr-line)
+            (push candidate before)
+          (push candidate after))))
+    (nconc before after)))
+
+(defun chief/consult-line-backward (&optional initial)
+  "Search current buffer with Consult, prioritizing lines before point."
+  (interactive)
+  (require 'consult)
+  (let* ((curr-line (line-number-at-pos (point) consult-line-numbers-widen))
+         (candidates (consult--slow-operation "Collecting lines..."
+                       (chief/consult--line-candidates-backward curr-line))))
+    (consult--read
+     candidates
+     :prompt "Go to line backward: "
+     :annotate (consult--line-fontify curr-line)
+     :category 'consult-location
+     :sort nil
+     :require-match t
+     :add-history (list (thing-at-point 'symbol) isearch-string)
+     :history '(:input consult--line-history)
+     :lookup #'consult--line-match
+     :default (car candidates)
+     :initial (or initial
+                  (and isearch-mode
+                       (prog1 isearch-string (isearch-done))))
+     :state (consult--location-state candidates))))
+
 (defun chief/consult-project-buffers ()
   "Search across project buffers."
   (interactive)
@@ -123,6 +157,7 @@
   :demand t
   :bind
   (("C-s" . consult-line)
+   ("C-r" . chief/consult-line-backward)
    ("C-x b" . consult-buffer)
    ("M-y" . consult-yank-pop)
    ("C-c h" . consult-history)

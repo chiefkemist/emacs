@@ -110,6 +110,23 @@ masquerade as the primary language server for a buffer.")
      :label "Java"
      :doc-url "https://emacs-lsp.github.io/lsp-java/"
      :help "Install JDT LS and configure a valid JDK 17+ so `jdtls` can start cleanly.")
+    (:modes (csharp-mode csharp-ts-mode)
+     :label "C# csharp-ls"
+     :install-command ("dotnet" "tool" "install" "-g" "csharp-ls")
+     :install-predicate (lambda () (executable-find "dotnet"))
+     :doc-url "https://github.com/razzmatazz/csharp-language-server"
+     :help "This setup launches csharp-ls from ~/.dotnet/tools and enables metadata + Razor .cshtml support.")
+    (:modes (fsharp-mode fsharp-ts-mode)
+     :label "F# FsAutoComplete"
+     :install-command ("dotnet" "tool" "install" "-g" "fsautocomplete")
+     :install-predicate (lambda () (executable-find "dotnet"))
+     :doc-url "https://github.com/fsharp/FsAutoComplete")
+    (:modes (vbnet-mode visual-basic-mode vb-mode)
+     :label "VB.NET language server"
+     :install-command ("dotnet" "tool" "install" "-g" "DNAKode.VbNet.Lsp")
+     :install-predicate (lambda () (executable-find "dotnet"))
+     :doc-url "https://github.com/DNAKode/vbnet-lsp"
+     :help "Installs the `vbnet-ls --stdio` server used for .vb files.")
     (:modes (tuareg-mode reason-mode caml-mode)
      :label "OCaml"
      :install-command ("opam" "install" "ocaml-lsp-server")
@@ -263,7 +280,10 @@ masquerade as the primary language server for a buffer.")
    ((derived-mode-p 'rust-ts-mode)
     (when (fboundp 'chief/rust-project-root)
       (chief/rust-project-root)))
-   ((derived-mode-p 'csharp-mode 'csharp-ts-mode 'fsharp-mode)
+   ((or (derived-mode-p 'csharp-mode 'csharp-ts-mode 'fsharp-mode 'fsharp-ts-mode 'vbnet-mode)
+        (and (derived-mode-p 'web-mode)
+             buffer-file-name
+             (string-match-p "\\.cshtml\\'" buffer-file-name)))
     (when (fboundp 'chief/dotnet-project-root)
       (chief/dotnet-project-root)))
    ((derived-mode-p 'swift-mode)

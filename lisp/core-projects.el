@@ -53,7 +53,13 @@
     "tsconfig.json"
     "jsconfig.json"
     "dune-project"
-    "dune-workspace")
+    "dune-workspace"
+    "global.json"
+    "Directory.Build.props"
+    "Directory.Build.targets"
+    "Directory.Packages.props"
+    "NuGet.config"
+    ".config/dotnet-tools.json")
   "Extra project root markers recognized by `project.el'."
   :type '(repeat string)
   :group 'chief)

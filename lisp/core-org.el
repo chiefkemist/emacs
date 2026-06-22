@@ -33,6 +33,7 @@
     "o" '(:ignore t :which-key "org")
     "oa" #'org-agenda
     "oc" #'org-capture
+    "od" #'org-babel-detangle
     "ol" #'org-store-link)
   (chief/local-leader-def
     :keymaps 'org-mode-map
