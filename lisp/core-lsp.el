@@ -111,16 +111,19 @@ masquerade as the primary language server for a buffer.")
      :doc-url "https://emacs-lsp.github.io/lsp-java/"
      :help "Install JDT LS and configure a valid JDK 17+ so `jdtls` can start cleanly.")
     (:modes (csharp-mode csharp-ts-mode)
-     :label "C# csharp-ls"
-     :install-command ("dotnet" "tool" "install" "-g" "csharp-ls")
-     :install-predicate (lambda () (executable-find "dotnet"))
-     :doc-url "https://github.com/razzmatazz/csharp-language-server"
-     :help "This setup launches csharp-ls from ~/.dotnet/tools and enables metadata + Razor .cshtml support.")
+     :label "C# official Roslyn language server"
+     :install-function chief/dotnet-install-roslyn-language-server
+     :install-predicate chief/dotnet-tool-installable-p
+     :resume-after-install t
+     :doc-url "https://www.nuget.org/packages/roslyn-language-server/"
+     :help "Installs Microsoft's maintained Roslyn stdio language server as a global dotnet tool.")
     (:modes (fsharp-mode fsharp-ts-mode)
      :label "F# FsAutoComplete"
-     :install-command ("dotnet" "tool" "install" "-g" "fsautocomplete")
-     :install-predicate (lambda () (executable-find "dotnet"))
-     :doc-url "https://github.com/fsharp/FsAutoComplete")
+     :install-function chief/dotnet-install-fsautocomplete
+     :install-predicate chief/dotnet-tool-installable-p
+     :resume-after-install t
+     :doc-url "https://github.com/ionide/FsAutoComplete"
+     :help "Installs the maintained FsAutoComplete server as a global dotnet tool.")
     (:modes (vbnet-mode visual-basic-mode vb-mode)
      :label "VB.NET language server"
      :install-command ("dotnet" "tool" "install" "-g" "DNAKode.VbNet.Lsp")
@@ -788,9 +791,68 @@ METHOD is the corresponding LSP method like \"textDocument/inlayHint\"."
   "Return non-nil when LSP signature help should be enabled for this buffer."
   (chief/lsp-capability-present-p "signatureHelpProvider" "textDocument/signatureHelp"))
 
+(defvar-local chief/lsp-inlay-hints-deferred nil
+  "Non-nil while a language server is still loading project semantics.")
+
+(defvar-local chief/lsp-diagnostics-deferred nil
+  "Non-nil while diagnostics must wait for project initialization.")
+
+(defvar-local chief/lsp-diagnostics-disabled nil
+  "Non-nil when LSP diagnostics are intentionally hidden in this buffer.")
+
+(defun chief/lsp-request-pull-diagnostics-a (orig-fn workspace)
+  "Call ORIG-FN for WORKSPACE when diagnostics can run in this buffer."
+  (unless (or chief/lsp-diagnostics-deferred
+              chief/lsp-diagnostics-disabled)
+    (funcall orig-fn workspace)))
+
+(advice-add 'lsp-diagnostics--request-pull-diagnostics
+            :around #'chief/lsp-request-pull-diagnostics-a)
+
+(defun chief/lsp-hold-diagnostics ()
+  "Stop rendering diagnostics while they are deferred or disabled.
+
+Language servers may publish provisional diagnostics before their project
+model is ready.  Keeping Flycheck inactive prevents those transient results
+from crossing `flycheck-checker-error-threshold' and disabling the LSP checker
+for the rest of the buffer's lifetime."
+  (when (or chief/lsp-diagnostics-deferred
+            chief/lsp-diagnostics-disabled)
+    (when (and (fboundp 'lsp-diagnostics-mode)
+               (bound-and-true-p lsp-diagnostics-mode))
+      (lsp-diagnostics-mode -1))
+    (when (and (fboundp 'flycheck-mode)
+               (bound-and-true-p flycheck-mode))
+      (flycheck-mode -1))))
+
+(defun chief/lsp-clear-buffer-diagnostics (workspace)
+  "Clear provisional diagnostics for the current buffer in WORKSPACE."
+  (when (and workspace buffer-file-name
+             (fboundp 'lsp-diagnostics--apply-pull-diagnostics)
+             (fboundp 'lsp--fix-path-casing))
+    (lsp-diagnostics--apply-pull-diagnostics
+     workspace (lsp--fix-path-casing buffer-file-name) "full" [])))
+
+(defun chief/lsp-resume-diagnostics (workspace)
+  "Resume diagnostics for the current buffer in WORKSPACE.
+
+Discard diagnostics produced by Roslyn's temporary miscellaneous project
+before requesting results from the initialized project snapshot."
+  (setq-local chief/lsp-diagnostics-deferred nil)
+  (unless chief/lsp-diagnostics-disabled
+    (chief/lsp-clear-buffer-diagnostics workspace)
+    (when (fboundp 'lsp-diagnostics-mode)
+      (lsp-diagnostics-mode 1))
+    (when (and (fboundp 'flycheck-reset-enabled-checker)
+               (bound-and-true-p flycheck-mode))
+      (flycheck-reset-enabled-checker 'lsp))
+    (when (fboundp 'lsp-diagnostics--request-pull-diagnostics)
+      (lsp-diagnostics--request-pull-diagnostics workspace))))
+
 (defun chief/lsp-inlay-hints-allowed-p ()
   "Return non-nil when inlay hints should be enabled for the current buffer."
-  (and (not (derived-mode-p 'text-mode))
+  (and (not chief/lsp-inlay-hints-deferred)
+       (not (derived-mode-p 'text-mode))
        (chief/lsp-capability-present-p "inlayHintProvider" "textDocument/inlayHint")))
 
 (defun chief/lsp-sanitize-inlay-hints ()
@@ -960,14 +1022,25 @@ built-in `kotlin-ls' client when needed."
   "Return a session key for LABEL scoped to the current project."
   (format "%s:%s" label (chief/lsp-project-root)))
 
-(defun chief/lsp-run-install-command (command label)
-  "Run install COMMAND for LABEL in a compilation buffer."
-  (let ((default-directory (chief/lsp-project-root))
-        (compilation-read-command nil))
-    (compilation-start
-     (mapconcat #'shell-quote-argument command " ")
-     'compilation-mode
-     (lambda (_) (format "*install %s lsp*" (downcase label))))))
+(defun chief/lsp-run-install-command (command label &optional on-success)
+  "Run install COMMAND for LABEL in a compilation buffer.
+Call ON-SUCCESS after a successful installation when it is non-nil."
+  (let* ((default-directory (chief/lsp-project-root))
+         (compilation-read-command nil)
+         (buffer
+          (compilation-start
+           (mapconcat #'shell-quote-argument command " ")
+           'compilation-mode
+           (lambda (_) (format "*install %s lsp*" (downcase label))))))
+    (when on-success
+      (with-current-buffer buffer
+        (add-hook
+         'compilation-finish-functions
+         (lambda (_buffer status)
+           (when (string-prefix-p "finished" status)
+             (funcall on-success)))
+         nil t)))
+    buffer))
 
 (defun chief/lsp-buffer-status ()
   "Return a plist describing current-buffer LSP support."
@@ -1022,6 +1095,8 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
           (let* ((install-function (plist-get spec :install-function))
                  (install-command (plist-get spec :install-command))
                  (install-predicate (plist-get spec :install-predicate))
+                 (resume-after-install
+                  (plist-get spec :resume-after-install))
                  (install-available-p
                   (cond
                    (install-predicate
@@ -1049,18 +1124,28 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
                             label)
                     choices))))
             (setq-local lsp-warn-no-matched-clients nil)
-            (pcase choice
-              (?i
-               (cond
-                (install-function
-                 (call-interactively install-function))
-                (install-command
-                 (chief/lsp-run-install-command install-command label)))
-               'manual)
-              (?d
-               (chief/lsp-show-install-docs label doc-url help)
-               'manual)
-              (_ 'manual)))))))))
+            (let* ((source-buffer (current-buffer))
+                   (resume
+                    (and resume-after-install
+                         (lambda ()
+                           (when (buffer-live-p source-buffer)
+                             (with-current-buffer source-buffer
+                               (chief/lsp-managed-mode-setup)))))))
+              (pcase choice
+                (?i
+                 (cond
+                  ((and install-function resume)
+                   (funcall install-function resume))
+                  (install-function
+                   (call-interactively install-function))
+                  (install-command
+                   (chief/lsp-run-install-command
+                    install-command label resume)))
+                 'manual)
+                (?d
+                 (chief/lsp-show-install-docs label doc-url help)
+                 'manual)
+                (_ 'manual))))))))))
 
 (defun chief/lsp-managed-mode-setup ()
   "Start or provision LSP support for the current buffer."
@@ -1202,11 +1287,19 @@ Return one of `ready', `auto', `downloading', `manual', or nil."
                        "[/\\\\]\\.pytest_cache\\'"
                        "[/\\\\]\\.cache\\'"
                        "[/\\\\]\\.dart_tool\\'"
+                       "[/\\\\]\\.bloop\\'"
+                       "[/\\\\]\\.bsp\\'"
                        "[/\\\\]\\.gradle\\'"
+                       "[/\\\\]\\.metals\\'"
+                       "[/\\\\]\\.scala-build\\'"
                        "[/\\\\]\\.zig-cache\\'"
                        "[/\\\\]\\.yarn\\'"
                        "[/\\\\]\\.pnpm-store\\'"
                        "[/\\\\]\\.npm\\'"
+                       "[/\\\\]\\.idea\\'"
+                       "[/\\\\]bin\\'"
+                       "[/\\\\]obj\\'"
+                       "[/\\\\]scratch\\'"
                        "[/\\\\]\\.turbo\\'"
                        "[/\\\\]\\.next\\'"
                        "[/\\\\]node_modules\\'"

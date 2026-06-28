@@ -11,7 +11,9 @@
 /eln-cache/
 /etc/custom.el
 /network-security.data
+/out/
 /projects.eld
+/test/
 /tramp
 /tree-sitter/
 /url/

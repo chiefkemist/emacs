@@ -451,22 +451,15 @@ hook is not guaranteed to run with the receiving source buffer current."
       (chief/project-normalize-root
        (locate-dominating-file start "lean-toolchain")))))
 
-(defun chief/lean-outermost-toolchain-root (&optional start)
-  "Return the outermost ancestor containing `lean-toolchain' from START."
-  (let ((file-name (or (and buffer-file-name (expand-file-name buffer-file-name))
-                       (chief/project-normalize-root start)
-                       (chief/project-default-start-directory)))
-        root)
-    (while-let ((dir (locate-dominating-file file-name "lean-toolchain")))
-      (setq root (chief/project-normalize-root dir)
-            file-name (file-name-directory (directory-file-name dir))))
-    root))
-
 (defun chief/lean-project-root ()
-  "Return the preferred Lean workspace root for the current buffer."
+  "Return the preferred Lean workspace root for the current buffer.
+Prefer the nearest Lake package so `lake serve' runs in the package whose
+imports and build configuration apply to the file.  A parent `lean-toolchain'
+is only a fallback; it must not pull a nested Lake package up to a polyglot
+workspace root."
   (chief/project-preferred-root
-   (chief/lean-outermost-toolchain-root)
    (chief/lean-nearest-lake-root)
+   (chief/lean-nearest-toolchain-root)
    (chief/project-current-root)
    default-directory))
 

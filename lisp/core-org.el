@@ -1,5 +1,34 @@
 ;;; core-org.el --- Org mode setup -*- lexical-binding: t; -*-
 
+(require 'subr-x)
+
+(defun chief/org--block-spec-parts (spec)
+  "Return normalized Org block SPEC and its block name."
+  (let* ((trimmed (string-trim spec))
+         (normalized (replace-regexp-in-string
+                      "\\`\\(?:#\\+\\)?begin_" "" trimmed)))
+    (unless (string-match-p "\\S-" normalized)
+      (user-error "Org block name is required"))
+    (list normalized (car (split-string normalized "[ \t]+" t)))))
+
+(defun chief/org-insert-block (spec)
+  "Insert an Org begin/end block from SPEC.
+Example SPEC: \"src rust :results output\".  When the region is active, wrap it
+inside the inserted block."
+  (interactive (list (read-string "Org block: " "src ")))
+  (let* ((parts (chief/org--block-spec-parts spec))
+         (normalized (car parts))
+         (block-name (cadr parts)))
+    (if (use-region-p)
+        (let ((body (delete-and-extract-region (region-beginning) (region-end))))
+          (insert "#+begin_" normalized "\n"
+                  body
+                  (if (string-suffix-p "\n" body) "" "\n")
+                  "#+end_" block-name "\n"))
+      (insert "#+begin_" normalized "\n")
+      (save-excursion
+        (insert "\n#+end_" block-name "\n")))))
+
 (use-package org
   :straight nil
   :mode ("\\.org\\'" . org-mode)
@@ -38,6 +67,7 @@
   (chief/local-leader-def
     :keymaps 'org-mode-map
     "b" '(:ignore t :which-key "babel")
+    "bi" #'chief/org-insert-block
     "be" #'org-babel-execute-src-block
     "bn" #'org-babel-next-src-block
     "bp" #'org-babel-previous-src-block

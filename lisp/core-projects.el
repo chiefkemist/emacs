@@ -28,6 +28,16 @@
     "Cargo.toml"
     "Cargo.lock"
     "Package.swift"
+    "build.sbt"
+    "project/build.properties"
+    "project/plugins.sbt"
+    "build.sc"
+    "build.mill"
+    ".mill-version"
+    "project.scala"
+    "scala-cli.yaml"
+    "scala-cli.yml"
+    "scala-cli.conf"
     "pom.xml"
     "mvnw"
     "gradlew"
@@ -54,12 +64,14 @@
     "jsconfig.json"
     "dune-project"
     "dune-workspace"
+    "rescript.json"
     "global.json"
     "Directory.Build.props"
     "Directory.Build.targets"
     "Directory.Packages.props"
     "NuGet.config"
-    ".config/dotnet-tools.json")
+    ".config/dotnet-tools.json"
+    "dotnet-tools.json")
   "Extra project root markers recognized by `project.el'."
   :type '(repeat string)
   :group 'chief)
@@ -137,9 +149,38 @@ Each choice may be a root directory string, a list of marker names, or nil."
   (when-let* ((file (chief/project-nearest-matching-file regexp start limit)))
     (chief/project-normalize-root (file-name-directory file))))
 
+(defun chief/project-try-nested-marker (directory)
+  "Return the nearest nested-marker project above DIRECTORY.
+Prefer an equally near or deeper VC-aware project so an outer nested marker
+cannot override an inner repository."
+  (when-let* ((markers
+               (seq-filter #'file-name-directory
+                           chief/project-root-markers))
+              (root
+               (chief/project-normalize-root
+                (locate-dominating-file
+                 directory
+                 (lambda (candidate)
+                   (seq-some
+                    (lambda (marker)
+                      (file-exists-p (expand-file-name marker candidate)))
+                    markers))))))
+    (let* ((vc-project (ignore-errors (project-try-vc directory)))
+           (vc-root (and vc-project
+                         (chief/project-normalize-root
+                          (project-root vc-project)))))
+      (when (or (not vc-root)
+                (> (length root) (length vc-root)))
+        (cons 'transient root)))))
+
+(add-hook 'project-find-functions #'chief/project-try-nested-marker)
+
 (when (boundp 'project-vc-extra-root-markers)
   (dolist (marker chief/project-root-markers)
-    (add-to-list 'project-vc-extra-root-markers marker t)))
+    ;; `project-vc-extra-root-markers' accepts basenames and basename globs,
+    ;; while nested paths are handled by `chief/project-try-nested-marker'.
+    (unless (file-name-directory marker)
+      (add-to-list 'project-vc-extra-root-markers marker t))))
 
 (provide 'core-projects)
 ;;; core-projects.el ends here

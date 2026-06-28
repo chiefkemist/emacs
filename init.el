@@ -54,6 +54,7 @@
         core-treesit
         core-lsp
         core-dap
+        lang-typst
         lang-dart
         lang-cljd
         lang-clojure
@@ -64,10 +65,12 @@
         lang-jsts
         lang-java
         lang-kotlin
+        lang-scala
         lang-nim
         lang-nushell
         lang-python
         lang-polyglot
+        lang-rescript
         lang-dotnet
         lang-rust
         lang-lean

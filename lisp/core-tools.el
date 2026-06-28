@@ -15,6 +15,21 @@
 (use-package xterm-color
   :defer t)
 
+(defun chief/compilation-use-line-oriented-output ()
+  "Keep compilation subprocesses from emitting terminal control sequences."
+  ;; `compilation-mode' is not a terminal emulator.  A pipe makes isatty(3)
+  ;; false, so progress renderers do not send cursor-motion and screen-clearing
+  ;; escapes to the compilation buffer.
+  (setq-local process-connection-type nil))
+
+(use-package compile
+  :straight nil
+  :hook (compilation-mode . chief/compilation-use-line-oriented-output)
+  :init
+  ;; The subprocess is connected to a pipe, so do not advertise the terminal
+  ;; inherited by the Emacs process to tools which inspect only the environment.
+  (setq compilation-environment '("TERM=dumb" "COLORTERM")))
+
 (defun chief/avy-goto-word-0 ()
   "Jump to a visible word start immediately with Avy."
   (interactive)
