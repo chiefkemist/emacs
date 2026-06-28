@@ -54,6 +54,7 @@
         core-treesit
         core-lsp
         core-dap
+        lang-typst
         lang-dart
         lang-cljd
         lang-clojure
