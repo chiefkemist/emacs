@@ -54,6 +54,7 @@
     "jsconfig.json"
     "dune-project"
     "dune-workspace"
+    "rescript.json"
     "global.json"
     "Directory.Build.props"
     "Directory.Build.targets"
