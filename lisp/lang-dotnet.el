@@ -1316,6 +1316,85 @@ member so a current ILSpy can provide the definition instead."
     (when (and assembly type (file-readable-p assembly))
       (list :assembly assembly :type type :member member :message message))))
 
+(defun chief/dotnet-lsp-content-strings (value)
+  "Return all strings nested in LSP content VALUE."
+  (cond
+   ((stringp value) (list value))
+   ((vectorp value)
+    (cl-mapcan #'chief/dotnet-lsp-content-strings (append value nil)))
+   ((hash-table-p value)
+    (let (strings)
+      (maphash
+       (lambda (_key item)
+         (setq strings
+               (nconc strings (chief/dotnet-lsp-content-strings item))))
+       value)
+      strings))
+   ((consp value)
+    (cl-mapcan #'chief/dotnet-lsp-content-strings value))))
+
+(defun chief/fsharp-hover-documentation-data (hover)
+  "Return FsAutoComplete documentation metadata embedded in HOVER."
+  (when-let* ((contents (and hover (lsp:hover-contents hover)))
+              (text (string-join
+                     (chief/dotnet-lsp-content-strings contents) "\n"))
+              ((string-match
+                "command:fsharp\\.showDocumentation\\?\\([^'\">]+\\)" text))
+              (encoded (match-string 1 text))
+              (decoded (url-unhex-string encoded))
+              (document
+               (ignore-errors
+                 (json-parse-string
+                  decoded :object-type 'hash-table :array-type 'list
+                  :null-object nil :false-object nil)))
+              (item (car-safe document)))
+    item))
+
+(defun chief/fsharp-xml-doc-definition (signature)
+  "Return declaring type and member from XML documentation SIGNATURE."
+  (when (and (stringp signature)
+             (string-match "\\`\\([TMPFE]\\):\\(.+\\)" signature))
+    (let* ((kind (match-string 1 signature))
+           (body (match-string 2 signature))
+           (name (car (split-string body "(")))
+           (separator (and (not (string= kind "T"))
+                           (string-match "\\.[^.]+\\'" name)))
+           (type (if separator (substring name 0 separator) name))
+           (member (and separator (substring name (1+ separator)))))
+      (when member
+        (setq member
+              (replace-regexp-in-string "``[0-9]+\\'" "" member)))
+      (when (string= member "#ctor")
+        (setq member (car (last (split-string type "[.+]" t)))))
+      (list :type type :member member))))
+
+(defun chief/dotnet-assembly-by-name (name &optional project)
+  "Return the assembly named NAME available to PROJECT."
+  (seq-find
+   (lambda (file)
+     (string-equal (file-name-base file) name))
+   (chief/dotnet-reference-assembly-files project)))
+
+(defun chief/fsharp-nonexistent-source-info (err params)
+  "Recover external definition metadata for an FSAC source-path ERR.
+PARAMS identifies the original source position.  FsAutoComplete can return
+source paths from its build machine for framework symbols; its hover response
+still contains an exact XML documentation signature and assembly identity."
+  (let ((message (chief/lsp-request-error-message err)))
+    (when (string-match-p "Range for nonexistent file found" message)
+      (when-let* ((hover
+                   (condition-case nil
+                       (lsp-request "textDocument/hover" params)
+                     (error nil)))
+                  (documentation
+                   (chief/fsharp-hover-documentation-data hover))
+                  (signature (gethash "XmlDocSig" documentation))
+                  (assembly-name (gethash "AssemblyName" documentation))
+                  (definition (chief/fsharp-xml-doc-definition signature))
+                  (assembly
+                   (chief/dotnet-assembly-by-name assembly-name)))
+        (append (list :assembly assembly :message message) definition)))))
+
 (defun chief/fsharp-metadata-workspace-directory
     (assembly source-root &optional source-project)
   "Return the metadata workspace for ASSEMBLY and SOURCE-ROOT.
@@ -2389,11 +2468,15 @@ ACTION controls how the destination is displayed."
           (chief/dotnet-provision-ilspy-for-namespace
            namespace source-buffer action))))))
 
-(defun chief/fsharp-handle-definition-error (err source-buffer action)
-  "Handle FSAC definition ERR from SOURCE-BUFFER, using display ACTION."
+(defun chief/fsharp-handle-definition-error
+    (err source-buffer action params)
+  "Handle FSAC definition ERR from SOURCE-BUFFER, using display ACTION.
+PARAMS identifies the original definition request position."
   (when (buffer-live-p source-buffer)
     (with-current-buffer source-buffer
-      (if-let* ((info (chief/fsharp-external-definition-info err)))
+      (if-let* ((info
+                 (or (chief/fsharp-external-definition-info err)
+                     (chief/fsharp-nonexistent-source-info err params))))
           (if (chief/dotnet-tool-executable "ilspycmd")
               (chief/fsharp-show-external-definition info source-buffer action)
             (chief/fsharp-provision-ilspy-for-definition
@@ -2459,7 +2542,7 @@ declarations when a server returns no location or generated metadata."
         ((chief/dotnet-navigate-local-type symbol source-buffer action))
         (fsharp-p
          (chief/fsharp-handle-definition-error
-          err source-buffer action))
+          err source-buffer action params))
         (t
          (message "C# definition failed: %s"
                   (car (split-string
