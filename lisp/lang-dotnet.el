@@ -40,6 +40,15 @@
   :type '(repeat string)
   :group 'chief-dotnet)
 
+(defcustom chief/dotnet-executable-test-args nil
+  "Arguments passed to executable projects used as custom test suites.
+
+These arguments follow the `--' separator in `dotnet run' and `dotnet watch
+run' commands.  Source-level test names are not added automatically because
+custom runners do not share a standard filtering protocol."
+  :type '(repeat string)
+  :group 'chief-dotnet)
+
 (defcustom chief/dotnet-build-configuration "Debug"
   "Configuration used by .NET build and debug helpers."
   :type 'string
@@ -941,12 +950,65 @@ PREFER-PROJECT is non-nil."
              names
              "|"))
 
+(defun chief/dotnet-vstest-project-p (project)
+  "Return non-nil when PROJECT declares a standard .NET test driver."
+  (with-temp-buffer
+    (insert-file-contents project)
+    (goto-char (point-min))
+    (let ((case-fold-search t))
+      (or (re-search-forward
+           "<IsTestProject\\(?:[[:space:]][^>]*\\)?>[[:space:]]*true[[:space:]]*</IsTestProject>"
+           nil t)
+          (progn
+            (goto-char (point-min))
+            (re-search-forward
+             (concat
+              "<PackageReference[^>]+Include=[\"']"
+              "[^\"']*\\(?:Microsoft\\.NET\\.Test\\.Sdk"
+              "\\|Microsoft\\.Testing\\.Platform"
+              "\\|TestAdapter\\|TestSdk\\)[^\"']*[\"']")
+             nil t))))))
+
+(defun chief/dotnet-executable-test-project-p (project)
+  "Return non-nil when PROJECT is an executable without a VSTest driver."
+  (and (string-equal
+        (downcase (or (chief/dotnet-project-property project 'OutputType) ""))
+        "exe")
+       (not (chief/dotnet-vstest-project-p project))))
+
+(defun chief/dotnet-executable-test-tail ()
+  "Return custom test-runner arguments with their `--' separator."
+  (when chief/dotnet-executable-test-args
+    (cons "--" chief/dotnet-executable-test-args)))
+
 (defun chief/dotnet-test-command (&optional extension names)
-  "Return a dotnet test command for EXTENSION and optional test NAMES."
-  (append (chief/dotnet-command-for-target "test" extension t)
-          chief/dotnet-test-args
+  "Return a test command for the current EXTENSION project.
+
+Use `dotnet test' and a VSTest filter for standard test projects.  Executable
+projects without a test SDK are treated as custom test suites and run with
+`dotnet run'.  Such runners receive `chief/dotnet-executable-test-args', but
+NAMES cannot be passed portably and the complete suite is run."
+  (let ((project (chief/dotnet-run-project extension)))
+    (if (chief/dotnet-executable-test-project-p project)
+        (progn
           (when names
-            (list "--filter" (chief/dotnet-test-filter names)))))
+            (message
+             "Custom executable test runner has no standard filter; running the complete suite"))
+          (append (chief/dotnet-command "run" "--project" project)
+                  (chief/dotnet-executable-test-tail)))
+      (append (chief/dotnet-command "test" project)
+              chief/dotnet-test-args
+              (when names
+                (list "--filter" (chief/dotnet-test-filter names)))))))
+
+(defun chief/dotnet-watch-test-command (extension)
+  "Return a watch-test command for the current EXTENSION project."
+  (let ((project (chief/dotnet-run-project extension)))
+    (if (chief/dotnet-executable-test-project-p project)
+        (append (chief/dotnet-command "watch" "--project" project "run")
+                (chief/dotnet-executable-test-tail))
+      (append (chief/dotnet-command "watch" "--project" project "test")
+              chief/dotnet-test-args))))
 
 (defun chief/dotnet-debug-project (project name)
   "Build PROJECT and launch a CoreCLR DAP session named NAME."
@@ -1013,8 +1075,8 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
                   pid (error-message-string err))
          nil)))))
 
-(defun chief/dotnet-debug-test (extension names)
-  "Debug .NET tests in EXTENSION project filtered by NAMES."
+(defun chief/dotnet-debug-vstest (extension names)
+  "Debug VSTest tests in EXTENSION project filtered by NAMES."
   (let ((source-buffer (current-buffer)))
     (chief/dotnet-require-netcoredbg
      ".NET test debugging"
@@ -1097,12 +1159,35 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
           (process-put process 'chief/dotnet-debug-test-timer timer)))
       process)))
 
+(defun chief/dotnet-debug-test (extension names)
+  "Debug .NET tests in EXTENSION project filtered by NAMES.
+
+Custom executable test suites cannot expose a portable test-host PID or name
+filter, so debug their complete program instead."
+  (let ((project (chief/dotnet-run-project extension)))
+    (if (chief/dotnet-executable-test-project-p project)
+        (progn
+          (when names
+            (message
+             "Custom executable test runner has no standard filter; debugging the complete suite"))
+          (chief/dotnet-debug-project project ".NET executable test suite"))
+      (chief/dotnet-debug-vstest extension names))))
+
 (defconst chief/csharp-test-attribute-regexp
-  "\\[\\(?:Fact\\|Theory\\|Test\\|TestCase\\|TestMethod\\|DataTestMethod\\|TestCaseSource\\)\\_>"
-  "Regexp matching common C# test attributes.")
+  (concat
+   "\\[\\(?:global::\\)?\\(?:[[:alnum:]_]+\\.\\)*"
+   "\\(?:Fact\\|Theory\\|Test\\|TestCase\\|TestMethod\\|DataTestMethod"
+   "\\|TestCaseSource\\)\\(?:Attribute\\)?\\_>")
+  "Regexp matching common C# test attributes, including qualified names.")
 
 (defconst chief/csharp-method-regexp
-  "^[ \t]*.*[ \t]+\\([[:alpha:]_][[:alnum:]_]*\\)[ \t]*(.*"
+  (concat
+   "^[ \t]*\\(?:\\[.*\\][ \t]*\\)*"
+   "\\(?:\\(?:public\\|private\\|protected\\|internal\\|static\\|virtual"
+   "\\|override\\|abstract\\|sealed\\|async\\|unsafe\\|extern\\|new"
+   "\\|partial\\)[ \t]+\\)*"
+   "[^][{};=\n]+?[ \t]+@?\\([[:alpha:]_][[:alnum:]_]*\\)[ \t]*"
+   "\\(?:<[^>{};()\n]*>[ \t]*\\)?(.*")
   "Regexp matching a C# method declaration line.")
 
 (defun chief/csharp-test-attribute-before-point-p ()
@@ -1111,8 +1196,10 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
     (let ((limit (save-excursion (forward-line -8) (point))))
       (catch 'found
         (forward-line -1)
-        (while (and (> (point) limit)
-                    (looking-at-p "^[ \t]*\\(?:\\[\\|//\\|$\\)"))
+        (while
+            (and (> (point) limit)
+                 (looking-at-p
+                  "^[ \t]*\\(?:\\[.*\\][ \t]*\\(?://.*\\)?\\|//.*\\)?$"))
           (when (looking-at-p (concat "^[ \t]*" chief/csharp-test-attribute-regexp))
             (throw 'found t))
           (forward-line -1))))))
@@ -1123,10 +1210,14 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
     (save-excursion
       (goto-char (point-min))
       (while (re-search-forward chief/csharp-method-regexp nil t)
-        (unless (nth 8 (save-excursion (syntax-ppss (match-beginning 0))))
-          (let ((name (match-string 1))
-                (position (match-beginning 0)))
-            (when (chief/csharp-test-attribute-before-point-p)
+        (let ((name (match-string-no-properties 1))
+              (position (match-beginning 0))
+              (declaration (match-string-no-properties 0)))
+          (unless (nth 8 (save-excursion (syntax-ppss position)))
+            (when (or (string-match-p chief/csharp-test-attribute-regexp declaration)
+                      (save-excursion
+                        (goto-char position)
+                        (chief/csharp-test-attribute-before-point-p)))
               (push (list :name name :position position) items))))))
     (nreverse items)))
 
@@ -1143,7 +1234,7 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
 (defun chief/dotnet-read-test-item (items prompt)
   "Return test item at point from ITEMS, or prompt with PROMPT."
   (unless items
-    (user-error "No test methods found in this file"))
+    (user-error "No tests found in this file"))
   (or (chief/dotnet-test-item-at-point items)
       (cdr (assoc (completing-read prompt
                                    (mapcar (lambda (item)
@@ -1204,10 +1295,10 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
     (chief/dotnet-compile (chief/dotnet-command "watch" "--project" project "run") "*dotnet watch run csharp*")))
 
 (defun chief/csharp-watch-test-project ()
-  "Run `dotnet watch test' for the current C# project."
+  "Watch and rerun the current C# test project."
   (interactive)
-  (let ((project (chief/dotnet-run-project "csproj")))
-    (chief/dotnet-compile (chief/dotnet-command "watch" "--project" project "test") "*dotnet watch test csharp*")))
+  (chief/dotnet-compile (chief/dotnet-watch-test-command "csproj")
+                        "*dotnet watch test csharp*"))
 
 (defun chief/csharp-restore-project ()
   "Run `dotnet restore' for the current C# project or solution."
@@ -1245,6 +1336,21 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
   "^[ \t]*\\(?:let\\|member\\)[ \t]+"
   "Regexp matching the start of an F# let binding or member line.")
 
+(defconst chief/fsharp-test-call-regexp
+  (concat
+   "\\_<\\(?:[fp]?test"
+   "\\(?:Async\\|Case\\(?:Async\\)?\\|Task\\|Property\\(?:WithConfig\\)?\\)?"
+   "\\)\\_>[ \t\r\n]*"
+   "\\(\"\\(?:\\\\.\\|[^\"\\\\]\\)*\"\\)")
+  "Regexp matching named F# test DSL calls such as testAsync and testCase.")
+
+(defun chief/fsharp-test-string-value (literal)
+  "Return the display name represented by F# string LITERAL."
+  (condition-case nil
+      (let ((value (read literal)))
+        (if (stringp value) value (substring literal 1 -1)))
+    (error (substring literal 1 -1))))
+
 (defun chief/fsharp-binding-name-on-line ()
   "Return the F# binding/member name on the current line."
   (let ((line (buffer-substring-no-properties
@@ -1269,17 +1375,27 @@ PROJECT and NAMES describe the test invocation.  Return non-nil after attach."
           (forward-line -1))))))
 
 (defun chief/fsharp-buffer-test-items ()
-  "Return plist entries for F# test bindings in the current buffer."
+  "Return plist entries for attributed bindings and F# test DSL calls."
   (let (items)
     (save-excursion
       (goto-char (point-min))
       (while (re-search-forward chief/fsharp-binding-regexp nil t)
-        (unless (nth 8 (save-excursion (syntax-ppss (match-beginning 0))))
-          (let* ((position (match-beginning 0))
-                 (name (chief/fsharp-binding-name-on-line)))
-            (when (and name (chief/fsharp-test-attribute-before-point-p))
-              (push (list :name name :position position) items))))))
-    (nreverse items)))
+        (let ((position (match-beginning 0)))
+          (unless (nth 8 (save-excursion (syntax-ppss position)))
+            (let ((name (chief/fsharp-binding-name-on-line)))
+              (when (and name (chief/fsharp-test-attribute-before-point-p))
+                (push (list :name name :position position) items))))))
+      (goto-char (point-min))
+      (while (re-search-forward chief/fsharp-test-call-regexp nil t)
+        (let ((position (match-beginning 0))
+              (literal (match-string-no-properties 1)))
+          (unless (nth 8 (save-excursion (syntax-ppss position)))
+            (push (list :name (chief/fsharp-test-string-value literal)
+                        :position position)
+                  items)))))
+    (sort items (lambda (left right)
+                  (< (plist-get left :position)
+                     (plist-get right :position))))))
 
 (defun chief/fsharp-external-definition-info (err)
   "Extract external symbol metadata from an FSAC definition error ERR.
@@ -2610,12 +2726,12 @@ declarations when a server returns no location or generated metadata."
   (let ((names (mapcar (lambda (item) (plist-get item :name))
                        (chief/fsharp-buffer-test-items))))
     (unless names
-      (user-error "No F# test bindings found in this buffer"))
+      (user-error "No F# tests found in this buffer"))
     (chief/dotnet-compile (chief/dotnet-test-command "fsproj" names)
                           "*dotnet test fsharp buffer*")))
 
 (defun chief/fsharp-test-at-point ()
-  "Run the F# test binding at point, prompting when needed."
+  "Run the F# test at point, prompting when needed."
   (interactive)
   (chief/polyglot-save-current-buffer)
   (let* ((item (chief/dotnet-read-test-item (chief/fsharp-buffer-test-items) "F# test: "))
@@ -2644,10 +2760,10 @@ declarations when a server returns no location or generated metadata."
     (chief/dotnet-compile (chief/dotnet-command "watch" "--project" project "run") "*dotnet watch run fsharp*")))
 
 (defun chief/fsharp-watch-test-project ()
-  "Run `dotnet watch test' for the current F# project."
+  "Watch and rerun the current F# test project."
   (interactive)
-  (let ((project (chief/dotnet-run-project "fsproj")))
-    (chief/dotnet-compile (chief/dotnet-command "watch" "--project" project "test") "*dotnet watch test fsharp*")))
+  (chief/dotnet-compile (chief/dotnet-watch-test-command "fsproj")
+                        "*dotnet watch test fsharp*"))
 
 (defun chief/fsharp-restore-project ()
   "Run `dotnet restore' for the current F# project or solution."
@@ -2683,7 +2799,7 @@ Offer to install Fantomas when neither a local nor global tool is available."
   (chief/dotnet-debug-project (chief/dotnet-run-project "fsproj") "F# project"))
 
 (defun chief/fsharp-debug-test-at-point ()
-  "Debug the F# test binding at point with netcoredbg attach flow."
+  "Debug the F# test at point with netcoredbg."
   (interactive)
   (let* ((item (chief/dotnet-read-test-item (chief/fsharp-buffer-test-items) "F# debug test: "))
          (name (plist-get item :name)))
@@ -3546,10 +3662,10 @@ references and F# compile order.  Standalone and `.fsx' files use `#load'."
     (chief/dotnet-compile (chief/dotnet-command "watch" "--project" project "run") "*dotnet watch run vbnet*")))
 
 (defun chief/vbnet-watch-test-project ()
-  "Run `dotnet watch test' for the current VB.NET project."
+  "Watch and rerun the current VB.NET test project."
   (interactive)
-  (let ((project (chief/dotnet-run-project "vbproj")))
-    (chief/dotnet-compile (chief/dotnet-command "watch" "--project" project "test") "*dotnet watch test vbnet*")))
+  (chief/dotnet-compile (chief/dotnet-watch-test-command "vbproj")
+                        "*dotnet watch test vbnet*"))
 
 (defun chief/vbnet-restore-project ()
   "Run `dotnet restore' for the current VB.NET project or solution."
