@@ -92,6 +92,10 @@ explicit restore commands when a project needs restored assets."
 (defvar chief/dotnet-restore-history (make-hash-table :test #'equal)
   "Projects already considered for pre-LSP restore in this Emacs session.")
 
+(defvar chief/dotnet-fsharp-loaded-projects
+  (make-hash-table :test #'eq :weakness 'key)
+  "F# projects explicitly loaded in each live FsAutoComplete workspace.")
+
 (defvar chief/dotnet-roslyn-metadata-roots (make-hash-table :test #'equal)
   "Map Roslyn metadata-as-source files back to their workspace roots.")
 
@@ -4069,6 +4073,55 @@ path and `gd' reports \"Not found\" even though the server returned a location."
   (or (chief/dotnet-local-tool-ready-p "fsautocomplete")
       (chief/dotnet-tool-executable "fsautocomplete")))
 
+(defun chief/dotnet-fsharp-workspace ()
+  "Return the FsAutoComplete workspace attached to the current buffer."
+  (when (fboundp 'lsp-workspaces)
+    (seq-find
+     (lambda (workspace)
+       (eq (lsp--client-server-id (lsp--workspace-client workspace)) 'fsac))
+     (lsp-workspaces))))
+
+(defun chief/dotnet-fsharp-load-current-project (&optional force)
+  "Ensure the nearest F# project is loaded by FsAutoComplete.
+
+This supplements FSAC's one-time workspace discovery.  It is needed when a
+nested project is added after the workspace starts and for test projects that
+automatic solution loading can omit.  With FORCE, request a reload even when
+this Emacs session already loaded the project."
+  (when (and (derived-mode-p 'fsharp-mode 'fsharp-ts-mode)
+             (bound-and-true-p lsp-managed-mode))
+    (when-let* ((project (chief/dotnet-project-file "fsproj"))
+                (project (file-truename project))
+                (workspace (chief/dotnet-fsharp-workspace)))
+      (let ((loaded (gethash workspace chief/dotnet-fsharp-loaded-projects)))
+        (when (or force (not (member project loaded)))
+          (condition-case err
+              (with-lsp-workspace workspace
+                ;; `fsharp/workspaceLoad' calls its field `uri', but FSAC and
+                ;; lsp-fsharp both expect an absolute project path here.
+                (lsp-request
+                 "fsharp/workspaceLoad"
+                 `(:textDocuments [(:uri ,project)]))
+                (puthash workspace
+                         (cons project (delete project loaded))
+                         chief/dotnet-fsharp-loaded-projects)
+                (lsp--info "Loaded nested F# project %s"
+                           (file-relative-name
+                            project (lsp--workspace-root workspace)))
+                t)
+            (error
+             (message "Could not load F# project %s: %s"
+                      project (error-message-string err))
+             nil)))))))
+
+(defun chief/fsharp-reload-current-project ()
+  "Reload the nearest F# project in the active FsAutoComplete workspace."
+  (interactive)
+  (unless (bound-and-true-p lsp-managed-mode)
+    (user-error "FsAutoComplete is not active in this buffer"))
+  (unless (chief/dotnet-fsharp-load-current-project t)
+    (user-error "FsAutoComplete could not load the current F# project")))
+
 (defun chief/dotnet-vbnet-ls-available-p ()
   "Return non-nil when the VB.NET language server is available."
   (or (chief/dotnet-local-tool-ready-p "vbnet-ls")
@@ -4189,7 +4242,12 @@ path and `gd' reports \"Not found\" even though the server returned a location."
     (setq-local lsp-fsharp-use-dotnet-local-tool
                 (chief/dotnet-local-tool-ready-p "fsautocomplete"))
     (setq-local lsp-fsharp-workspace-extra-exclude-dirs
-                '("bin" "obj" ".git" ".ionide" ".fake" "scratch"))))
+                '("bin" "obj" ".git" ".ionide" ".fake" "scratch"))
+    ;; A long-lived solution workspace does not rediscover projects created
+    ;; beneath it.  `lsp-after-open-hook' runs after the buffer has an attached
+    ;; workspace, unlike `lsp-mode-hook', which is too early for this request.
+    (add-hook 'lsp-after-open-hook
+              #'chief/dotnet-fsharp-load-current-project 80 t)))
 
 (defun chief/vbnet-mode-setup ()
   "Configure VB.NET buffers with LSP completion and dotnet commands."
@@ -4729,6 +4787,7 @@ does not currently ship as a stable client."
     "cw" #'chief/fsharp-watch-run-project
     "cW" #'chief/fsharp-watch-test-project
     "cR" #'chief/fsharp-restore-project
+    "cL" #'chief/fsharp-reload-current-project
     "cf" #'chief/fsharp-format-project
     "r" '(:ignore t :which-key "run")
     "rr" #'chief/fsharp-run-project
