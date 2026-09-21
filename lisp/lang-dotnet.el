@@ -74,6 +74,18 @@ explicit restore commands when a project needs restored assets."
   :type 'directory
   :group 'chief-dotnet)
 
+(defcustom chief/fsharp-file-runner-directory
+  (locate-user-emacs-file "var/fsharp-file-runners/")
+  "Directory for generated projects that execute compiled F# source files."
+  :type 'directory
+  :group 'chief-dotnet)
+
+(defcustom chief/csharp-file-runner-directory
+  (locate-user-emacs-file "var/csharp-file-runners/")
+  "Directory for generated projects that execute compiled C# source files."
+  :type 'directory
+  :group 'chief-dotnet)
+
 (defvar-local chief/dotnet-metadata-source-root nil
   "Original project root for a generated .NET metadata buffer.")
 (put 'chief/dotnet-metadata-source-root 'permanent-local t)
@@ -894,6 +906,11 @@ PREFER-PROJECT is non-nil."
         (when-let* ((value (chief/dotnet-xml-text group tag)))
           (throw 'value value))))))
 
+(defun chief/dotnet-project-sdk (project)
+  "Return PROJECT's root SDK name, or the base .NET SDK."
+  (or (xml-get-attribute (chief/dotnet-project-xml project) 'Sdk)
+      "Microsoft.NET.Sdk"))
+
 (defun chief/dotnet-project-target-framework (project)
   "Return the first target framework declared by PROJECT."
   (or (chief/dotnet-project-property project 'TargetFramework)
@@ -1285,6 +1302,105 @@ filter, so debug their complete program instead."
          (name (plist-get item :name)))
     (chief/dotnet-compile (chief/dotnet-test-command "csproj" (list name))
                           (format "*dotnet test %s*" name))))
+
+(defun chief/csharp-file-runner-project (source &optional project)
+  "Write and return a generated project that runs C# SOURCE.
+
+When PROJECT is non-nil, inherit its SDK, target framework, common compiler
+properties, and public project dependencies through a project reference."
+  (let* ((framework
+          (or (and project (chief/dotnet-project-target-framework project))
+              (chief/dotnet-sdk-target-framework)
+              (user-error "Could not determine a target framework for %s" source)))
+         (key (secure-hash
+               'sha1
+               (concat (and project (file-truename project))
+                       "\0" (file-truename source))))
+         (directory
+          (expand-file-name (substring key 0 16)
+                            chief/csharp-file-runner-directory))
+         (runner (expand-file-name "CSharpFileRunner.csproj" directory))
+         (assembly (concat "ChiefCSharpFileRunner_" (substring key 0 12)))
+         (properties '(LangVersion Nullable ImplicitUsings
+                                   AllowUnsafeBlocks DefineConstants)))
+    (make-directory directory t)
+    (with-temp-file runner
+      (insert (format "<Project Sdk=\"%s\">\n"
+                      (xml-escape-string
+                       (if project
+                           (chief/dotnet-project-sdk project)
+                         "Microsoft.NET.Sdk"))))
+      (insert "  <PropertyGroup>\n")
+      (insert "    <OutputType>Exe</OutputType>\n")
+      (insert (format "    <TargetFramework>%s</TargetFramework>\n"
+                      (xml-escape-string framework)))
+      (insert (format "    <AssemblyName>%s</AssemblyName>\n" assembly))
+      (insert "    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>\n")
+      (when project
+        (dolist (property properties)
+          (when-let* ((value (chief/dotnet-project-property project property)))
+            (insert (format "    <%s>%s</%s>\n"
+                            property (xml-escape-string value) property)))))
+      (insert "  </PropertyGroup>\n")
+      (insert "  <ItemGroup>\n")
+      (when project
+        (insert (format "    <ProjectReference Include=\"%s\" />\n"
+                        (xml-escape-string (expand-file-name project)))))
+      (insert (format "    <Compile Include=\"%s\" Link=\"%s\" />\n"
+                      (xml-escape-string (expand-file-name source))
+                      (xml-escape-string (file-name-nondirectory source))))
+      (insert "  </ItemGroup>\n</Project>\n"))
+    runner))
+
+(defun chief/csharp-script-command (file &optional on-install)
+  "Return a terminating C# script command for FILE.
+ON-INSTALL resumes the operation after provisioning CSharpRepl."
+  (let ((program
+         (chief/dotnet-require-global-tool
+          "csharprepl" "csharprepl" #'chief/dotnet-install-csharp-repl
+          "C# script execution" on-install))
+        (project (chief/dotnet-project-file "csproj")))
+    (append (list program)
+            (when project (list "--reference" project))
+            (list "--eval-file" file))))
+
+(defun chief/csharp-run-script ()
+  "Run the current `.csx' file with CSharpRepl and exit."
+  (interactive)
+  (chief/polyglot-save-current-buffer)
+  (let* ((source-buffer (current-buffer))
+         (file (chief/polyglot-current-file "C#"))
+         (extension (downcase (or (file-name-extension file) ""))))
+    (unless (string= extension "csx")
+      (user-error "This is a compiled C# source file; use `chief/csharp-run-file'"))
+    (chief/dotnet-compile
+     (chief/csharp-script-command
+      file
+      (lambda ()
+        (when (buffer-live-p source-buffer)
+          (with-current-buffer source-buffer
+            (chief/csharp-run-script)))))
+     "*csharp script*" (file-name-directory file))))
+
+(defun chief/csharp-run-file ()
+  "Run the current C# source file while retaining `.csx' script support."
+  (interactive)
+  (chief/polyglot-save-current-buffer)
+  (let* ((file (chief/polyglot-current-file "C#"))
+         (extension (downcase (or (file-name-extension file) "")))
+         (project (chief/dotnet-project-file "csproj")))
+    (cond
+     ((string= extension "csx")
+      (chief/csharp-run-script))
+     ((string= extension "cs")
+      (let ((runner (chief/csharp-file-runner-project file project)))
+        (chief/dotnet-compile
+         (chief/dotnet-command
+          "run" "--project" runner
+          "--configuration" chief/dotnet-build-configuration)
+         "*dotnet run csharp file*" (file-name-directory file))))
+     (t
+      (user-error "Unsupported C# file extension: %s" extension)))))
 
 (defun chief/csharp-run-project ()
   "Run the current C# project."
@@ -2749,13 +2865,95 @@ declarations when a server returns no location or generated metadata."
   (let ((project (chief/dotnet-run-project "fsproj")))
     (chief/dotnet-compile (chief/dotnet-command "run" "--project" project) "*dotnet run fsharp*")))
 
+(defun chief/fsharp-file-runner-project (project source)
+  "Write and return a generated project that runs compiled F# SOURCE.
+
+PROJECT supplies SOURCE's normal references and build context.  Compiling the
+source into a tiny executable preserves ordinary `.fs' syntax while avoiding
+execution of the original project's entry point."
+  (let* ((framework
+          (or (chief/dotnet-project-target-framework project)
+              (user-error "No TargetFramework found in %s" project)))
+         (key (secure-hash
+               'sha1
+               (concat (file-truename project) "\0" (file-truename source))))
+         (directory
+          (expand-file-name (substring key 0 16)
+                            chief/fsharp-file-runner-directory))
+         (runner (expand-file-name "FSharpFileRunner.fsproj" directory))
+         (assembly (concat "ChiefFSharpFileRunner_" (substring key 0 12)))
+         (language-version (chief/dotnet-project-property project 'LangVersion)))
+    (make-directory directory t)
+    (with-temp-file runner
+      (insert
+       (format
+        (concat
+         "<Project Sdk=\"Microsoft.NET.Sdk\">\n"
+         "  <PropertyGroup>\n"
+         "    <OutputType>Exe</OutputType>\n"
+         "    <TargetFramework>%s</TargetFramework>\n"
+         "    <AssemblyName>%s</AssemblyName>\n"
+         "    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>\n"
+         "%s"
+         "  </PropertyGroup>\n"
+         "  <ItemGroup>\n"
+         "    <ProjectReference Include=\"%s\" />\n"
+         "    <Compile Include=\"%s\" Link=\"%s\" />\n"
+         "  </ItemGroup>\n"
+         "</Project>\n")
+        (xml-escape-string framework)
+        assembly
+        (if language-version
+            (format "    <LangVersion>%s</LangVersion>\n"
+                    (xml-escape-string language-version))
+          "")
+        (xml-escape-string (expand-file-name project))
+        (xml-escape-string (expand-file-name source))
+        (xml-escape-string (file-name-nondirectory source)))))
+    runner))
+
 (defun chief/fsharp-run-script ()
-  "Run the current F# script with `dotnet fsi'."
+  "Run the current `.fsx' or `.fsscript' file with terminating FSI."
   (interactive)
   (chief/polyglot-save-current-buffer)
-  (chief/dotnet-compile (chief/dotnet-command "fsi" (chief/polyglot-current-file "F#"))
-                        "*dotnet fsi*"
-                        (file-name-directory (chief/polyglot-current-file "F#"))))
+  (let* ((file (chief/polyglot-current-file "F#"))
+         (extension (downcase (or (file-name-extension file) ""))))
+    (unless (member extension '("fsx" "fsscript"))
+      (user-error "This is a compiled F# source file; use `chief/fsharp-run-file'"))
+    (chief/dotnet-compile
+     (chief/dotnet-command "fsi" "--exec" file)
+     "*dotnet fsi*" (file-name-directory file))))
+
+(defun chief/fsharp-run-file ()
+  "Run the current F# source file while retaining script support.
+
+Scripts are delegated to `chief/fsharp-run-script'.  A regular `.fs' file
+inside a project is compiled into a cached one-file executable which references
+its project, so normal module syntax and project dependencies remain available.
+A standalone `.fs' file runs through terminating FSI."
+  (interactive)
+  (chief/polyglot-save-current-buffer)
+  (let* ((file (chief/polyglot-current-file "F#"))
+         (extension (downcase (or (file-name-extension file) "")))
+         (directory (file-name-directory file)))
+    (cond
+     ((member extension '("fsx" "fsscript"))
+      (chief/fsharp-run-script))
+     ((and (string= extension "fs")
+           (chief/dotnet-project-file "fsproj"))
+      (let* ((project (chief/dotnet-project-file "fsproj"))
+             (runner (chief/fsharp-file-runner-project project file)))
+        (chief/dotnet-compile
+         (chief/dotnet-command
+          "run" "--project" runner
+          "--configuration" chief/dotnet-build-configuration)
+         "*dotnet run fsharp file*" directory)))
+     ((string= extension "fs")
+      (chief/dotnet-compile
+       (chief/dotnet-command "fsi" "--exec" file)
+       "*dotnet fsi*" directory))
+     (t
+      (user-error "Unsupported F# file extension: %s" extension)))))
 
 (defun chief/fsharp-watch-run-project ()
   "Run `dotnet watch run' for the current F# project."
@@ -4753,9 +4951,13 @@ does not currently ship as a stable client."
     "cw" #'chief/csharp-watch-run-project
     "cW" #'chief/csharp-watch-test-project
     "cR" #'chief/csharp-restore-project
+    "cF" #'chief/csharp-run-file
+    "cs" #'chief/csharp-run-script
     "cf" #'chief/csharp-format-project
     "r" '(:ignore t :which-key "run")
+    "rf" #'chief/csharp-run-file
     "rr" #'chief/csharp-run-project
+    "rs" #'chief/csharp-run-script
     "rw" #'chief/csharp-watch-run-project
     "t" '(:ignore t :which-key "test")
     "tt" #'chief/csharp-test-at-point
@@ -4783,6 +4985,7 @@ does not currently ship as a stable client."
     "cT" #'chief/fsharp-test-buffer
     "ca" #'chief/fsharp-test-at-point
     "cr" #'chief/fsharp-run-project
+    "cF" #'chief/fsharp-run-file
     "cs" #'chief/fsharp-run-script
     "cw" #'chief/fsharp-watch-run-project
     "cW" #'chief/fsharp-watch-test-project
@@ -4790,6 +4993,7 @@ does not currently ship as a stable client."
     "cL" #'chief/fsharp-reload-current-project
     "cf" #'chief/fsharp-format-project
     "r" '(:ignore t :which-key "run")
+    "rf" #'chief/fsharp-run-file
     "rr" #'chief/fsharp-run-project
     "rs" #'chief/fsharp-run-script
     "rw" #'chief/fsharp-watch-run-project
