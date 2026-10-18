@@ -6,12 +6,13 @@
 (declare-function evil-normal-state "evil-states" ())
 (declare-function evil-set-initial-state "evil-core" (mode state))
 (declare-function ghostel-copy-mode "ghostel" ())
-(declare-function ghostel-copy-mode-exit "ghostel" ())
+(declare-function ghostel-emacs-mode "ghostel" ())
+(declare-function ghostel-readonly-exit "ghostel" ())
 (declare-function ghostel-send-next-key "ghostel" ())
 (declare-function ghostel-yank "ghostel" ())
 (defvar evil-state)
-(defvar ghostel--copy-mode-active)
-(defvar ghostel-copy-mode-map)
+(defvar ghostel--input-mode)
+(defvar ghostel-readonly-mode-map)
 (defvar ghostel-mode-map)
 
 (defun chief/terminal-frame-p (&optional frame)
@@ -83,26 +84,31 @@
 (add-hook 'tty-setup-hook #'chief/terminal-setup)
 (add-hook 'after-make-frame-functions #'chief/terminal-setup)
 
+(defun chief/ghostel-readonly-p ()
+  "Return non-nil when Ghostel is in copy or Emacs read-only mode."
+  (and (boundp 'ghostel--input-mode)
+       (memq ghostel--input-mode '(copy emacs))))
+
 (defun chief/ghostel-command-state-setup ()
   "Make a Ghostel buffer safe for Emacs/Evil command-state interaction.
 Ghostel's copy mode freezes terminal output, installs a navigation-friendly
 keymap, restores ordinary Emacs mouse selection, and prevents Evil commands
 from accidentally editing the rendered terminal contents."
   (when (and (derived-mode-p 'ghostel-mode)
-             (not (bound-and-true-p ghostel--copy-mode-active)))
+             (not (chief/ghostel-readonly-p)))
     (ghostel-copy-mode)))
 
 (defun chief/ghostel-insert-state-setup ()
   "Return a Ghostel buffer to live terminal input in Evil insert state."
   (when (and (derived-mode-p 'ghostel-mode)
-             (bound-and-true-p ghostel--copy-mode-active))
-    (ghostel-copy-mode-exit)))
+             (chief/ghostel-readonly-p))
+    (ghostel-readonly-exit)))
 
 (defun chief/ghostel-sync-evil-state (&rest _)
   "Keep Ghostel copy mode and Evil command/insert states synchronized."
   (when (and (derived-mode-p 'ghostel-mode)
              (bound-and-true-p evil-local-mode))
-    (if (bound-and-true-p ghostel--copy-mode-active)
+    (if (chief/ghostel-readonly-p)
         (when (eq evil-state 'insert)
           (evil-normal-state))
       (unless (eq evil-state 'insert)
@@ -112,15 +118,15 @@ from accidentally editing the rendered terminal contents."
   "Resume terminal input and send Ghostel's next key literally.
 This is the Doom-style escape hatch for keys normally reserved by Emacs."
   (interactive)
-  (when (bound-and-true-p ghostel--copy-mode-active)
-    (ghostel-copy-mode-exit))
+  (when (chief/ghostel-readonly-p)
+    (ghostel-readonly-exit))
   (ghostel-send-next-key))
 
 (defun chief/ghostel-yank ()
   "Resume terminal input and paste the latest Emacs kill into Ghostel."
   (interactive)
-  (when (bound-and-true-p ghostel--copy-mode-active)
-    (ghostel-copy-mode-exit))
+  (when (chief/ghostel-readonly-p)
+    (ghostel-readonly-exit))
   (ghostel-yank))
 
 (defun chief/ghostel-mode-setup (&optional preserve-state)
@@ -130,6 +136,9 @@ read-only copy mode, where Evil, Emacs prefix keys, and mouse selection work.
 When PRESERVE-STATE is non-nil, do not force an already-live buffer to insert
 state."
   (setq-local confirm-kill-processes nil)
+  ;; Normal-state letters must navigate rather than exit copy mode and get
+  ;; forwarded to the shell by Ghostel's optional fast-exit keymap.
+  (setq-local ghostel-readonly-fast-exit nil)
   (when (boundp 'evil-move-cursor-back)
     (setq-local evil-move-cursor-back nil))
   (add-hook 'evil-normal-state-entry-hook
@@ -157,6 +166,10 @@ state."
              :host github
              :repo "dakra/ghostel")
   :commands (ghostel ghostel-project ghostel-other)
+  :init
+  ;; Native binaries survive package rebuilds without living in tracked files.
+  (setq ghostel-module-directory
+        (expand-file-name "ghostel/" chief/var-directory))
   :hook (ghostel-mode . chief/ghostel-mode-setup)
   :config
   ;; Doom's vterm integration reserves C-q as a one-shot literal-key escape
@@ -164,9 +177,9 @@ state."
   ;; mode supplies the matching safe command state, including ordinary Emacs
   ;; mouse selection instead of forwarding clicks to a terminal application.
   (define-key ghostel-mode-map (kbd "C-q") #'chief/ghostel-send-next-key)
-  (define-key ghostel-copy-mode-map (kbd "C-q") #'chief/ghostel-send-next-key)
+  (define-key ghostel-readonly-mode-map (kbd "C-q") #'chief/ghostel-send-next-key)
   (define-key ghostel-mode-map (kbd "C-c C-k") #'kill-current-buffer)
-  (define-key ghostel-copy-mode-map (kbd "C-c C-k") #'kill-current-buffer)
+  (define-key ghostel-readonly-mode-map (kbd "C-c C-k") #'kill-current-buffer)
   ;; Unlike Ghostel's default, Doom's vterm leaves ordinary mouse clicks and
   ;; drag selection with Emacs.  Keep terminal-specific wheel scrolling, but do
   ;; not let terminal applications swallow window selection or mouse regions.
@@ -175,13 +188,14 @@ state."
                  "<down-mouse-3>" "<mouse-3>" "<drag-mouse-3>"))
     (define-key ghostel-mode-map (kbd key) nil))
   (advice-add #'ghostel-copy-mode :after #'chief/ghostel-sync-evil-state)
-  (advice-add #'ghostel-copy-mode-exit :after #'chief/ghostel-sync-evil-state)
+  (advice-add #'ghostel-emacs-mode :after #'chief/ghostel-sync-evil-state)
+  (advice-add #'ghostel-readonly-exit :after #'chief/ghostel-sync-evil-state)
   (with-eval-after-load 'evil
     (evil-set-initial-state 'ghostel-mode 'insert)
     (evil-define-key 'insert ghostel-mode-map
       (kbd "<escape>") #'evil-normal-state
       (kbd "C-q") #'chief/ghostel-send-next-key)
-    (evil-define-key 'normal ghostel-copy-mode-map
+    (evil-define-key 'normal ghostel-readonly-mode-map
       (kbd "q") #'quit-window
       (kbd "p") #'chief/ghostel-yank
       (kbd "P") #'chief/ghostel-yank))

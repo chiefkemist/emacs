@@ -1,5 +1,35 @@
+# Generated Emacs files and editor/OS temporary files.
 *.elc
+*.eln
+*~
+\#*#
+.\#*
+*.tmp
+*.tmp*
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
 .DS_Store
+
+# Build outputs, logs, and Python helper caches.
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.log
+*.pyc
+*.pyo
+__pycache__/
+
+# Local credentials; retain sanitized environment templates.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 
 /.cache/
 /.local/
@@ -13,12 +43,11 @@
 /network-security.data
 /out/
 /projects.eld
-/test/*
-!/test/lang-dotnet-test.el
 /tramp
 /tree-sitter/
 /url/
+# All installed packages, caches, and runtime data stay local.
 /var/
 
 /transient/
-etc
+/etc/

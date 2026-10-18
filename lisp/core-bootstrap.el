@@ -22,6 +22,10 @@
   (make-directory (expand-file-name directory chief/var-directory) t))
 
 (setq straight-base-dir chief/var-directory)
+;; Keep reproducible package revisions separate from ignored runtime data.
+(setq straight-profiles
+      `((nil . ,(expand-file-name "straight/versions/default.el"
+                                 user-emacs-directory))))
 (setq straight-use-package-by-default t)
 (setq straight-check-for-modifications '(check-on-save find-when-checking))
 (setq straight-cache-autoloads t)

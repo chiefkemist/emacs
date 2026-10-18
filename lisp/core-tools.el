@@ -1,11 +1,6 @@
 ;;; core-tools.el --- Daily tooling -*- lexical-binding: t; -*-
 
 (declare-function chief/large-buffer-p "core-ui" (&optional threshold))
-(autoload 'agent-shell-openai-start-codex "agent-shell-openai" nil t)
-(autoload 'agent-shell-google-start-gemini "agent-shell-google" nil t)
-(autoload 'agent-shell-cursor-start-agent "agent-shell-cursor" nil t)
-(autoload 'agent-shell-pi-start-agent "agent-shell-pi" nil t)
-(autoload 'agent-shell-opencode-start-agent "agent-shell-opencode" nil t)
 
 (use-package envrc
   :defer 1
@@ -497,7 +492,8 @@ This lets delta's styling carry the visual weight instead."
   (setq diff-hl-draw-borders nil)
   (setq diff-hl-side 'left)
   (diff-hl-flydiff-mode 1)
-  (add-hook 'magit-pre-refresh-hook #'diff-hl-magit-pre-refresh)
+  ;; diff-hl 1.11 no longer needs a pre-refresh hook.
+  (remove-hook 'magit-pre-refresh-hook 'diff-hl-magit-pre-refresh)
   (add-hook 'magit-post-refresh-hook #'diff-hl-magit-post-refresh))
 
 (use-package hl-todo
@@ -514,21 +510,20 @@ This lets delta's styling carry the visual weight instead."
           ("PERF" . "#7ee787")
           ("BUG" . "#ff5555"))))
 
-(use-package agent-shell
-  :commands (agent-shell)
-  :config
-  (when (require 'agent-shell-openai nil t)
-    (when (fboundp 'agent-shell-openai-make-codex-config)
-      (setq agent-shell-preferred-agent-config
-            (agent-shell-openai-make-codex-config))))
+(use-package pilish
+  :straight (:host github :repo "dnouri/pilish")
+  :commands (pilish pilish-toggle pilish-session-browser)
+  :init
+  ;; Respect Pi's saved project trust decisions rather than approving every
+  ;; project's local extensions and MCP servers automatically.
+  (setq pilish-project-trust-policy 'default)
+  (defalias 'pi #'pilish)
   (chief/leader-def
-    "a" '(:ignore t :which-key "agent")
-    "aa" #'agent-shell
-    "ac" #'agent-shell-openai-start-codex
-    "ag" #'agent-shell-google-start-gemini
-    "ao" #'agent-shell-opencode-start-agent
-    "ar" #'agent-shell-cursor-start-agent
-    "ap" #'agent-shell-pi-start-agent))
+    "a" '(:ignore t :which-key "pi")
+    "aa" #'pilish
+    "ap" #'pilish
+    "at" #'pilish-toggle
+    "as" #'pilish-session-browser))
 
 (provide 'core-tools)
 ;;; core-tools.el ends here
