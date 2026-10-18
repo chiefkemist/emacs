@@ -663,8 +663,6 @@ SOURCE-LANGUAGE is sent to LLDB/GDB when supported.  ARGS are program args."
 (add-to-list 'auto-mode-alist '("\\.scm\\'" . scheme-mode))
 (add-to-list 'auto-mode-alist '("\\.ss\\'" . scheme-mode))
 (add-to-list 'auto-mode-alist '("\\.sld\\'" . scheme-mode))
-(add-to-list 'auto-mode-alist '("\\.mojo\\'" . python-ts-mode))
-(add-to-list 'auto-mode-alist '("\\.🔥\\'" . python-ts-mode))
 
 (add-hook 'ruby-mode-hook #'chief/ruby-mode-setup)
 (when (fboundp 'rust-ts-mode)

@@ -13,7 +13,8 @@
 /network-security.data
 /out/
 /projects.eld
-/test/
+/test/*
+!/test/lang-dotnet-test.el
 /tramp
 /tree-sitter/
 /url/

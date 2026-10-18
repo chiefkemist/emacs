@@ -68,6 +68,7 @@
         lang-scala
         lang-nim
         lang-nushell
+        lang-mojo
         lang-python
         lang-polyglot
         lang-rescript

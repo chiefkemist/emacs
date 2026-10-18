@@ -115,6 +115,10 @@ explicit restore commands when a project needs restored assets."
   (make-hash-table :test #'eq :weakness 'key)
   "Roslyn workspaces that completed project initialization.")
 
+(defvar chief/dotnet-roslyn-opened-targets
+  (make-hash-table :test #'eq :weakness 'key)
+  "Last solution or project targets explicitly opened in each Roslyn workspace.")
+
 (defvar chief/dotnet-roslyn-initialization-timers
   (make-hash-table :test #'eq :weakness 'key)
   "Pending project-initialization grace timers keyed by Roslyn workspace.")
@@ -283,22 +287,27 @@ alternative and for its experimental Razor support."
   "Regexp matching plain-text .NET workspace files.")
 
 (defun chief/dotnet-project-root ()
-  "Return the current .NET project root."
-  (chief/project-preferred-root
-   (chief/project-nearest-regexp-root "\\.slnx?\\'")
-   (chief/project-nearest-regexp-root "\\.slnf\\'")
-   (chief/project-nearest-regexp-root chief/dotnet-msbuild-project-regexp)
-   (chief/project-nearest-marker-root
-    '("global.json"
-      "Directory.Build.props"
-      "Directory.Build.targets"
-      "Directory.Build.rsp"
-      "Directory.Packages.props"
-      "NuGet.config"
-      "paket.dependencies"
-      "dotnet-tools.json"
-      ".config/dotnet-tools.json"))
-   (chief/polyglot-project-root)))
+  "Return the effective root for the current .NET project.
+
+Use an ancestor solution only when it actually contains the nearest project.
+An unrelated solution must not widen language-server discovery or redirect
+build, test, restore, formatting, and debugging commands away from the project."
+  (let* ((project (chief/dotnet-project-file))
+         (solution (chief/dotnet-solution-file project)))
+    (chief/project-preferred-root
+     (and solution (file-name-directory solution))
+     (and project (file-name-directory project))
+     (chief/project-nearest-marker-root
+      '("global.json"
+        "Directory.Build.props"
+        "Directory.Build.targets"
+        "Directory.Build.rsp"
+        "Directory.Packages.props"
+        "NuGet.config"
+        "paket.dependencies"
+        "dotnet-tools.json"
+        ".config/dotnet-tools.json"))
+     (chief/polyglot-project-root))))
 
 (defun chief/dotnet-root-directory ()
   "Return the first usable .NET installation root."
@@ -754,13 +763,9 @@ requested action after a successful installation."
         (user-error "%s requires the maintained dotnet tool %s" description package))))
 
 (defun chief/polyglot-dotnet-target ()
-  "Return the best dotnet build target for the current project."
-  (let ((root (chief/polyglot-project-root)))
-    (or (chief/polyglot-nearest-matching-file "\\.slnx?\\'" nil root)
-        (chief/polyglot-nearest-matching-file "\\.slnf\\'" nil root)
-        (chief/polyglot-nearest-matching-file "\\.csproj\\'" nil root)
-        (chief/polyglot-nearest-matching-file "\\.fsproj\\'" nil root)
-        (chief/polyglot-nearest-matching-file "\\.vbproj\\'" nil root))))
+  "Return the best membership-aware dotnet target for the current project."
+  (or (chief/dotnet-solution-file)
+      (chief/dotnet-project-file)))
 
 (defun chief/polyglot-csharp-project-file ()
   "Return the nearest C# project file."
@@ -798,13 +803,14 @@ requested action after a successful installation."
     (and (file-readable-p assets)
          (file-newer-than-file-p assets project))))
 
-(defun chief/dotnet-project-file (&optional extension)
-  "Return the nearest .NET project file.
+(defun chief/dotnet-project-file (&optional extension start limit)
+  "Return the nearest .NET project file between START and LIMIT.
 When EXTENSION is non-nil, prefer project files with that extension."
   (or (and extension
            (chief/polyglot-nearest-matching-file
-            (format "\\.%s\\'" (regexp-quote extension))))
-      (chief/polyglot-nearest-matching-file "\\.\\(?:cs\\|fs\\|vb\\)proj\\'")))
+            (format "\\.%s\\'" (regexp-quote extension)) start limit))
+      (chief/polyglot-nearest-matching-file
+       "\\.\\(?:cs\\|fs\\|vb\\)proj\\'" start limit)))
 
 (defun chief/dotnet-restore-project-for-lsp (&optional project force)
   "Restore PROJECT synchronously so LSP can load real references.
@@ -853,10 +859,148 @@ When FORCE is non-nil, restore even if the assets file appears current."
       (unless (chief/dotnet-project-assets-current-p project)
         (chief/dotnet-restore-project-for-lsp project)))))
 
-(defun chief/dotnet-solution-file ()
-  "Return the nearest .NET solution file."
-  (or (chief/polyglot-nearest-matching-file "\\.slnx?\\'")
-      (chief/polyglot-nearest-matching-file "\\.slnf\\'")))
+(defun chief/dotnet-solution-candidates (&optional start)
+  "Return ancestor solution files from START, nearest directories first."
+  (let ((directory
+         (file-name-as-directory
+          (expand-file-name
+           (or start
+               (chief/project-default-start-directory)
+               default-directory))))
+        candidates)
+    (while directory
+      (let* ((files
+              (chief/polyglot-directory-files-matching
+               directory "\\.\\(?:sln\\|slnx\\|slnf\\)\\'"))
+             (ordinary
+              (sort
+               (seq-filter
+                (lambda (file)
+                  (string-match-p "\\.slnx?\\'" file))
+                files)
+               #'string<))
+             (filters
+              (sort
+               (seq-filter
+                (lambda (file)
+                  (string-match-p "\\.slnf\\'" file))
+                files)
+               #'string<)))
+        (setq candidates (append candidates ordinary filters)))
+      (let ((parent
+             (file-name-directory
+              (directory-file-name directory))))
+        (setq directory
+              (unless (or (null parent)
+                          (equal parent directory))
+                parent))))
+    candidates))
+
+(defun chief/dotnet-solution-project-path (solution path &optional base)
+  "Resolve project PATH declared by SOLUTION, optionally relative to BASE."
+  (expand-file-name
+   (replace-regexp-in-string "\\\\" "/" path t t)
+   (or base (file-name-directory solution))))
+
+(defun chief/dotnet-sln-projects (solution)
+  "Return MSBuild projects declared by classic SOLUTION."
+  (when (file-readable-p solution)
+    (with-temp-buffer
+      (insert-file-contents solution)
+      (let (projects)
+        (goto-char (point-min))
+        (while
+            (re-search-forward
+             (concat
+              "^[[:space:]]*Project([^\n]*)[[:space:]]*="
+              "[[:space:]]*\"[^\"]*\"[[:space:]]*,"
+              "[[:space:]]*\"\\([^\"]+\\."
+              "\\(?:[[:alnum:]_-]+proj\\|proj\\)\\)\"")
+             nil t)
+          (push
+           (chief/dotnet-solution-project-path
+            solution (match-string-no-properties 1))
+           projects))
+        (nreverse projects)))))
+
+(defun chief/dotnet-slnf-projects (solution-filter)
+  "Return projects selected by SOLUTION-FILTER."
+  (when (file-readable-p solution-filter)
+    (condition-case nil
+        (with-temp-buffer
+          (insert-file-contents solution-filter)
+          (let* ((document
+                  (json-parse-buffer
+                   :object-type 'hash-table
+                   :array-type 'list
+                   :null-object nil
+                   :false-object nil))
+                 (selection (gethash "solution" document))
+                 (projects (and (hash-table-p selection)
+                                (gethash "projects" selection)))
+                 (solution-path (and (hash-table-p selection)
+                                     (gethash "path" selection)))
+                 (filter-directory (file-name-directory solution-filter))
+                 (solution-directory
+                  (and solution-path
+                       (file-name-directory
+                        (chief/dotnet-solution-project-path
+                         solution-filter solution-path))))
+                 (project-base (or solution-directory filter-directory))
+                 resolved)
+            ;; The projects array uses paths relative to the referenced
+            ;; solution, not relative to the filter file itself.
+            (dolist (path projects)
+              (when (stringp path)
+                (push
+                 (chief/dotnet-solution-project-path
+                  solution-filter path project-base)
+                 resolved)))
+            (nreverse resolved)))
+      (error nil))))
+
+(defun chief/dotnet-solution-projects (solution)
+  "Return project files explicitly contained by SOLUTION."
+  (cond
+   ((string-match-p "\\.sln\\'" solution)
+    (chief/dotnet-sln-projects solution))
+   ((string-match-p "\\.slnx\\'" solution)
+    (chief/dotnet-slnx-projects solution))
+   ((string-match-p "\\.slnf\\'" solution)
+    (chief/dotnet-slnf-projects solution))))
+
+(defun chief/dotnet-same-file-p (left right)
+  "Return non-nil when LEFT and RIGHT name the same file."
+  (and left right
+       (or (ignore-errors (file-equal-p left right))
+           (ignore-errors
+             (equal (file-truename (expand-file-name left))
+                    (file-truename (expand-file-name right)))))))
+
+(defun chief/dotnet-solution-contains-project-p (solution project)
+  "Return non-nil when SOLUTION explicitly contains PROJECT."
+  (seq-some
+   (lambda (member)
+     (chief/dotnet-same-file-p member project))
+   (chief/dotnet-solution-projects solution)))
+
+(defun chief/dotnet-solution-file (&optional project start)
+  "Return the nearest relevant .NET solution file.
+
+When PROJECT is non-nil, ignore ancestor solutions that do not contain it.
+START defaults to PROJECT's directory and then to the current buffer's
+location."
+  (let* ((project (or project (chief/dotnet-project-file nil start)))
+         (start (or start
+                    (and project (file-name-directory project))
+                    (chief/project-default-start-directory)))
+         (candidates (chief/dotnet-solution-candidates start)))
+    (if project
+        (seq-find
+         (lambda (solution)
+           (chief/dotnet-solution-contains-project-p solution project))
+         candidates)
+      (car candidates))))
 
 (defun chief/dotnet-build-target (&optional extension prefer-project)
   "Return a solution or project target for dotnet commands.
@@ -3924,8 +4068,9 @@ references and F# compile order.  Standalone and `.fsx' files use `#load'."
         (chief/dotnet-xml-descendants child tag))
       (xml-node-children node)))))
 
-(defun chief/dotnet-slnx-projects (solution extension)
-  "Return EXTENSION project members declared by SOLUTION."
+(defun chief/dotnet-slnx-projects (solution &optional extension)
+  "Return project members declared by SOLUTION.
+When EXTENSION is non-nil, include only projects with that extension."
   (when (file-readable-p solution)
     (condition-case nil
         (with-temp-buffer
@@ -3936,70 +4081,103 @@ references and F# compile order.  Standalone and `.fsx' files use `#load'."
             (dolist (project (chief/dotnet-xml-descendants document 'Project))
               (when-let* ((path (or (xml-get-attribute project 'Path)
                                     (xml-get-attribute project 'path)))
-                          ((string-match-p
-                            (format "\\.%s\\'" (regexp-quote extension))
-                            path)))
-                (push (expand-file-name path (file-name-directory solution))
-                      projects)))
+                          ((or (not extension)
+                               (string-match-p
+                                (format "\\.%s\\'" (regexp-quote extension))
+                                path))))
+                (push
+                 (chief/dotnet-solution-project-path solution path)
+                 projects)))
             (nreverse projects)))
       (error nil))))
 
+(defun chief/dotnet-workspace-project-files (workspace extension)
+  "Return EXTENSION projects represented by buffers in WORKSPACE.
+Fall back to matching project files directly in the workspace root while the
+first buffer is still attaching."
+  (let* ((root (file-name-as-directory (lsp--workspace-root workspace)))
+         projects)
+    (dolist (buffer (lsp--workspace-buffers workspace))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when-let* ((project
+                       (chief/dotnet-project-file extension nil root))
+                      ((file-in-directory-p project root)))
+            (push (file-truename project) projects)))))
+    (unless projects
+      (dolist (project
+               (chief/polyglot-directory-files-matching
+                root (format "\\.%s\\'" (regexp-quote extension))))
+        (push (file-truename project) projects)))
+    (sort (delete-dups projects) #'string<)))
+
+(defun chief/dotnet-common-project-solution (projects)
+  "Return one solution containing every project in PROJECTS, or nil."
+  (when projects
+    (let ((solutions
+           (mapcar
+            (lambda (project)
+              (chief/dotnet-solution-file
+               project (file-name-directory project)))
+            projects)))
+      (when (and (not (memq nil solutions))
+                 (cl-every
+                  (lambda (solution)
+                    (chief/dotnet-same-file-p solution (car solutions)))
+                  (cdr solutions)))
+        (car solutions)))))
+
 (defun chief/dotnet-roslyn-workspace-targets (workspace)
-  "Return the solution or C# projects Roslyn should open in WORKSPACE."
-  (let* ((root (lsp--workspace-root workspace))
-         (files (and (file-directory-p root)
-                     (directory-files root t nil t)))
-         (solutions
-          (seq-filter
-           (lambda (file)
-             (string-match-p "\\.\\(?:sln\\|slnf\\)\\'" file))
-           files))
-         (slnx-files
-          (seq-filter
-           (lambda (file)
-             (string-match-p "\\.slnx\\'" file))
-           files))
-         (slnx (car (sort slnx-files #'string<)))
+  "Return the membership-aware solution or C# projects for WORKSPACE."
+  (let* ((projects (chief/dotnet-workspace-project-files workspace "csproj"))
+         (solution (chief/dotnet-common-project-solution projects))
          (mixed-slnx-p
-          (and slnx (chief/dotnet-slnx-projects slnx "fsproj")))
+          (and solution
+               (string-match-p "\\.slnx\\'" solution)
+               (chief/dotnet-slnx-projects solution "fsproj")))
          (slnx-csharp-projects
           (and mixed-slnx-p
-               (chief/dotnet-slnx-projects slnx "csproj")))
-         (excluded '("bin" "obj" "scratch" ".git" ".idea"))
-         (projects
-          (and (not solutions) (not slnx)
-               (file-directory-p root)
-               (directory-files-recursively
-                root "\\.csproj\\'" nil
-                (lambda (directory)
-                  (not (member
-                        (file-name-nondirectory
-                         (directory-file-name directory))
-                        excluded)))))))
-    ;; Respect ordinary solution membership, solution filters, and pure-C#
-    ;; `.slnx' membership.  Open only the C# members of mixed C#/F# `.slnx'
-    ;; files because opening those solutions can leave package symbols in
-    ;; Roslyn's miscellaneous project.
-    (or (and solutions
-             (list :solution (car (sort solutions #'string<))))
-        (and slnx-csharp-projects
+               (chief/dotnet-slnx-projects solution "csproj"))))
+    ;; Open only actual solution members.  Mixed C#/F# `.slnx' files are
+    ;; represented by their C# projects because opening the whole solution can
+    ;; leave package symbols in Roslyn's miscellaneous project.  If buffers
+    ;; span membership boundaries, keep every represented project explicit.
+    (or (and slnx-csharp-projects
              (list :projects (sort slnx-csharp-projects #'string<)))
-        (and slnx (list :solution slnx))
-        (and projects (list :projects (sort projects #'string<))))))
+        (and solution (list :solution solution))
+        (and projects (list :projects projects)))))
+
+(defun chief/dotnet-roslyn-open-workspace-targets (workspace)
+  "Open the current membership-aware targets in Roslyn WORKSPACE.
+Return non-nil when targets exist.  Re-send only when represented projects
+change, so a workspace that initialized before its first buffer attached can
+be completed safely from `lsp-after-open-hook'."
+  (when-let* ((targets (chief/dotnet-roslyn-workspace-targets workspace)))
+    (unless (equal targets
+                   (gethash workspace chief/dotnet-roslyn-opened-targets))
+      (with-lsp-workspace workspace
+        (if-let* ((solution (plist-get targets :solution)))
+            (lsp-notify "solution/open"
+                        `(:solution ,(lsp--path-to-uri solution)))
+          (lsp-notify
+           "project/open"
+           `(:projects
+             ,(vconcat
+               (mapcar #'lsp--path-to-uri
+                       (plist-get targets :projects)))))))
+      (puthash workspace targets chief/dotnet-roslyn-opened-targets))
+    t))
 
 (defun chief/dotnet-roslyn-initialized (workspace)
   "Explicitly load the solution or projects associated with WORKSPACE."
-  (when-let* ((targets (chief/dotnet-roslyn-workspace-targets workspace)))
-    (with-lsp-workspace workspace
-      (if-let* ((solution (plist-get targets :solution)))
-          (lsp-notify "solution/open"
-                      `(:solution ,(lsp--path-to-uri solution)))
-        (lsp-notify
-         "project/open"
-         `(:projects
-           ,(vconcat
-             (mapcar #'lsp--path-to-uri
-                     (plist-get targets :projects)))))))))
+  (chief/dotnet-roslyn-open-workspace-targets workspace))
+
+(defun chief/dotnet-roslyn-open-targets-after-attach ()
+  "Open Roslyn targets after the current buffer joins its workspace."
+  (dolist (workspace (chief/lsp-current-workspaces))
+    (when (eq (lsp--client-server-id (lsp--workspace-client workspace))
+              'chief-roslyn)
+      (chief/dotnet-roslyn-open-workspace-targets workspace))))
 
 (defun chief/dotnet-roslyn-workspace-live-p (workspace)
   "Return non-nil when WORKSPACE still has a live Roslyn process."
@@ -4279,6 +4457,25 @@ path and `gd' reports \"Not found\" even though the server returned a location."
        (eq (lsp--client-server-id (lsp--workspace-client workspace)) 'fsac))
      (lsp-workspaces))))
 
+(defun chief/dotnet-fsharp-workspace-targets (workspace)
+  "Return only the F# projects relevant to WORKSPACE."
+  (let* ((projects
+          (chief/dotnet-workspace-project-files workspace "fsproj"))
+         (solution (chief/dotnet-common-project-solution projects)))
+    (or (and solution
+             (seq-filter
+              (lambda (project)
+                (string-match-p "\\.fsproj\\'" project))
+              (chief/dotnet-solution-projects solution)))
+        projects)))
+
+(defun chief/dotnet-fsharp-initialized (workspace)
+  "Configure and load membership-aware projects into FSAC WORKSPACE."
+  (with-lsp-workspace workspace
+    (lsp--set-configuration (lsp-configuration-section "fsharp"))
+    (when-let* ((projects (chief/dotnet-fsharp-workspace-targets workspace)))
+      (lsp-fsharp--workspace-load projects))))
+
 (defun chief/dotnet-fsharp-load-current-project (&optional force)
   "Ensure the nearest F# project is loaded by FsAutoComplete.
 
@@ -4327,9 +4524,10 @@ this Emacs session already loaded the project."
       (chief/dotnet-tool-executable "vbnet-ls")))
 
 (defun chief/dotnet-apply-solution-local ()
-  "Expose the nearest solution file to LSP clients."
-  (when-let* ((solution (chief/dotnet-solution-file)))
-    (setq-local lsp-csharp-solution-file (expand-file-name solution))))
+  "Expose only a containing solution file to LSP clients."
+  (let ((solution (chief/dotnet-solution-file)))
+    (setq-local lsp-csharp-solution-file
+                (and solution (expand-file-name solution)))))
 
 (defun chief/csharp-mode-setup ()
   "Configure C# buffers with LSP, REPL, tests, and dotnet commands."
@@ -4397,6 +4595,8 @@ this Emacs session already loaded the project."
   (when (eq chief/dotnet-csharp-server 'roslyn)
     (add-hook 'lsp-mode-hook
               #'chief/dotnet-roslyn-finish-late-buffer-setup 80 t)
+    (add-hook 'lsp-after-open-hook
+              #'chief/dotnet-roslyn-open-targets-after-attach 80 t)
     (add-hook 'lsp-mode-hook
               #'chief/dotnet-roslyn-apply-buffer-guards 95 t)
     (add-hook 'lsp-configure-hook
@@ -4435,7 +4635,10 @@ this Emacs session already loaded the project."
     (setq-local lsp-fsharp-simplify-name-analyzer t)
     (setq-local lsp-fsharp-resolve-namespaces t)
     (setq-local lsp-fsharp-enable-reference-code-lens t)
-    (setq-local lsp-fsharp-auto-workspace-init t)
+    ;; Project loading is performed explicitly by
+    ;; `chief/dotnet-fsharp-initialized' so FSAC cannot select an unrelated
+    ;; ancestor solution or discover sibling projects outside its membership.
+    (setq-local lsp-fsharp-auto-workspace-init nil)
     (setq-local lsp-fsharp-use-dotnet-tool-for-fsac nil)
     (setq-local lsp-fsharp-use-dotnet-local-tool
                 (chief/dotnet-local-tool-ready-p "fsautocomplete"))
@@ -4932,7 +5135,10 @@ does not currently ship as a stable client."
   (advice-add 'lsp-fsharp--make-launch-cmd
               :override #'chief/dotnet-fsautocomplete-command)
   (advice-add 'lsp-fsharp--test-fsautocomplete-present
-              :override #'chief/dotnet-fsautocomplete-available-p))
+              :override #'chief/dotnet-fsautocomplete-available-p)
+  (when-let* ((client (gethash 'fsac lsp-clients)))
+    (setf (lsp--client-initialized-fn client)
+          #'chief/dotnet-fsharp-initialized)))
 
 (with-eval-after-load 'csharp-mode
   (chief/repl-setup-standard-local-leader 'csharp-mode-map)

@@ -153,6 +153,7 @@ EXTENSION is the temp file extension and COMMAND-FORM must return a command list
                  ("ts" . typescript-ts)
                  ("tsx" . tsx-ts)
                  ("rust" . rust-ts)
+                 ("mojo" . chief/mojo)
                  ("csharp" . csharp-ts)
                  ("cs" . csharp-ts)
                  ("fsharp" . fsharp)
@@ -203,6 +204,7 @@ EXTENSION is the temp file extension and COMMAND-FORM must return a command list
         file))
 
 (require 'ob-rust-script)
+(require 'ob-mojo)
 
 (chief/org-babel-define-command-backend go ".go"
   (list (or (executable-find "go")
