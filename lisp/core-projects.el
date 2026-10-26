@@ -1,4 +1,4 @@
-;;; core-projects.el --- Project root tuning -*- lexical-binding: t; -*-
+;;; core-projects.el --- Project roots and file tree integration -*- lexical-binding: t; -*-
 
 (require 'cl-lib)
 (require 'project)
@@ -181,6 +181,33 @@ cannot override an inner repository."
     ;; while nested paths are handled by `chief/project-try-nested-marker'.
     (unless (file-name-directory marker)
       (add-to-list 'project-vc-extra-root-markers marker t))))
+
+(defun chief/treemacs-imenu-cleanup-a (function file)
+  "Clean up temporary buffers left by FUNCTION while indexing FILE.
+Treemacs suppresses mode hooks for tag indexing, but its error paths can
+leave that buffer visiting FILE.  A subsequent real visit then reuses the
+uninitialized buffer, without language setup, LSP, or other mode hooks."
+  (let ((existing-buffer (find-buffer-visiting file)))
+    (unwind-protect
+        (funcall function file)
+      (unless existing-buffer
+        (when-let* ((buffer (find-buffer-visiting file)))
+          (unless (or (buffer-modified-p buffer)
+                      (get-buffer-window buffer t))
+            (kill-buffer buffer)))))))
+
+(with-eval-after-load 'treemacs-tags
+  (advice-add 'treemacs--get-imenu-index :around #'chief/treemacs-imenu-cleanup-a))
+
+(use-package treemacs-evil
+  :after (treemacs evil)
+  :demand t
+  :config
+  ;; Also repair tree buffers that already existed when reloading the config.
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when (derived-mode-p 'treemacs-mode)
+        (evil-treemacs-state)))))
 
 (provide 'core-projects)
 ;;; core-projects.el ends here

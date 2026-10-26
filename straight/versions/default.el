@@ -66,6 +66,7 @@
  ("jsonrpc" . "18680cfe74c5a8d25ffd10ea2a64c63aa5b10162")
  ("julia-emacs" . "1b5a4c2f5b7c3f842785985bf8778b8805cc6766")
  ("kanagawa-emacs" . "fe06241196bf9c77df751cfd74a984b5d8a45ba4")
+ ("kkp" . "82b7443e10a2ba287467b62e90b6adb6dd93dc99")
  ("kotlin-mode" . "fddd747e5b4736e8b27a147960f369b86179ddff")
  ("let-alist" . "a331a39b02da002c6c570c4960106454f88a99a5")
  ("llama" . "6850d0c91b629da14fdff2300c222289d1a0029a")

@@ -4,6 +4,47 @@ Modular Emacs configuration in `lisp/`, using straight.el for packages.
 Runtime data, installed packages, compiled files, and local Custom settings are
 ignored by Git. Tests and the package lockfile are tracked.
 
+## Terminal keyboard input
+
+`emacs -nw` configures its own input handling; it does not modify terminal-app
+preferences or installations.
+
+- On macOS, `modules/macos-option-keys.c` exposes a read-only keyboard-layout
+  query directly to Elisp through Emacs's native module API. It identifies
+  printable Option characters and translates them into the corresponding Meta
+  keys, including Canadian layouts where Option+x sends `≈`. GUI input, quoted
+  insertion, bracketed paste, and input methods are left alone. Existing custom
+  translations are preserved. No Python interpreter or helper process is used.
+- `kkp` negotiates extended keys in compatible terminals, including `C-.`,
+  `C-;`, and `C-S-SPC`. It restores ordinary `C-g` during blocking subprocesses.
+- Legacy terminal NUL input reaches the command-state `C-SPC` leader while
+  retaining insert-state completion. In minibuffers, `C-c .` and `C-c ;` provide
+  Embark alternatives when a terminal cannot transmit `C-.` and `C-;`.
+
+The macOS module builds automatically on first use using already-installed
+Apple developer tools and the Emacs installation's `emacs-module.h`. It is
+cached under `var/native/` by architecture, Emacs major version, and source hash;
+subsequent layout reads call native functions directly. No tools are installed
+automatically, and compiled binaries are never tracked in Git.
+
+Setup is automatic for terminal frames. After changing the macOS keyboard
+layout, use `M-x chief/tty-refresh-option-translations`. Dead keys that emit no
+input and shortcuts consumed by the terminal/OS cannot be reconstructed;
+unsupported protocols retain legacy input rather than guessing key events.
+
+## Project integration
+
+Treemacs loads its Evil integration so both terminal `RET` and GUI Return open
+nodes. Failed tag lookups cannot leave hookless file buffers behind: actual
+file visits still initialize language tools, LSP, line numbers, and snippets.
+Editor-launched .NET tools use the newest installed runtime (including previews)
+so servers can load assemblies from the selected SDK; OS settings are unchanged.
+Tree-sitter remapping probes only the selected language and retains classic PHP
+editing when its embedded parsers are unavailable. Geiser does not override
+Racket's configured file association. Theme compatibility overlays retain the
+underlying palette and avoid cyclic Org/Gnus face inheritance during switches
+and terminal child-frame creation.
+
 ## Pi assistant
 
 [Pilish](https://github.com/dnouri/pilish) is installed directly from GitHub.
@@ -52,8 +93,9 @@ and restart Emacs. No native binaries belong in Git.
 Run configuration tests with the installed package environment:
 
 ```sh
-emacs --batch --init-directory "$PWD" -l "$PWD/init.el" \
+emacs --module-assertions --batch --init-directory "$PWD" -l "$PWD/init.el" \
   -l "$PWD/test/core-tools-test.el" \
+  -l "$PWD/test/core-terminal-keyboard-test.el" \
   -l "$PWD/test/lang-dotnet-test.el" \
   -l "$PWD/test/lang-scala-test.el" \
   -f ert-run-tests-batch-and-exit

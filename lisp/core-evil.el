@@ -31,7 +31,9 @@
   (setq evil-want-integration t)
   (setq evil-want-C-u-scroll t)
   (setq evil-want-C-i-jump nil)
-  (setq evil-esc-delay 0.01)
+  ;; Legacy Meta/terminal sequences can arrive in separate reads over SSH.
+  ;; At 10ms Evil mistakes a split Meta prefix for a standalone Escape.
+  (setq evil-esc-delay 0.1)
   (setq evil-respect-visual-line-mode t)
   (setq evil-undo-system 'undo-redo)
   :config

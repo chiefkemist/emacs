@@ -1,12 +1,30 @@
-;;; lang-dotnet-test.el --- Tests for .NET project isolation -*- lexical-binding: t; -*-
+;;; lang-dotnet-test.el --- Tests for .NET tooling and project isolation -*- lexical-binding: t; -*-
 
 ;;; Commentary:
-;; Regression tests for projects below unrelated solution files.
+;; Regression tests for editor tool runtimes and isolated project roots.
 
 ;;; Code:
 
 (require 'ert)
 (require 'lang-dotnet)
+
+(ert-deftest chief/dotnet-editor-tools-can-load-the-newest-sdk ()
+  "A matching older runtime must not strand servers below the selected SDK."
+  (should (equal (eval (car (get 'chief/dotnet-roll-forward 'standard-value)) t)
+                 "LatestMajor"))
+  (let ((process-environment (copy-sequence process-environment))
+        (chief/dotnet-roll-forward "LatestMajor")
+        (chief/dotnet-roll-forward-to-prerelease t))
+    (chief/dotnet-ensure-runtime-environment)
+    (should (equal (getenv "DOTNET_ROLL_FORWARD") "LatestMajor"))
+    (should (equal (getenv "DOTNET_ROLL_FORWARD_TO_PRERELEASE") "1"))
+    ;; Preserve the explicit customization escape hatch.
+    (let ((chief/dotnet-roll-forward "Major"))
+      (chief/dotnet-ensure-runtime-environment)
+      (should (equal (getenv "DOTNET_ROLL_FORWARD") "Major")))
+    (let ((chief/dotnet-roll-forward nil))
+      (chief/dotnet-ensure-runtime-environment)
+      (should (equal (getenv "DOTNET_ROLL_FORWARD") "Major")))))
 
 (defun chief/dotnet-test--write (root relative content)
   "Write CONTENT to RELATIVE under ROOT and return the resulting path."

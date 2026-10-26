@@ -192,10 +192,45 @@
                 (symbol-name lang)
                 (error-message-string err)))))))))))
 
+(defun chief/treesit-php-ready-p ()
+  "Return non-nil when all parsers required by Emacs 32 PHP editing exist."
+  (treesit-ready-p '(php phpdoc html javascript jsdoc css) t))
+
+(defun chief/treesit-php-maybe-a (function &rest args)
+  "Use classic PHP rather than partially initialize FUNCTION without parsers."
+  (if (chief/treesit-php-ready-p)
+      (apply function args)
+    (php-mode)))
+
+(when (>= emacs-major-version 32)
+  (with-eval-after-load 'php-ts-mode
+    (when (fboundp 'php-ts-mode-maybe)
+      (advice-add 'php-ts-mode-maybe :around #'chief/treesit-php-maybe-a))))
+
+(defun chief/treesit-set-major-remap (mode &rest _)
+  "Consider only MODE's grammar when selecting its tree-sitter replacement.
+Probing every recipe on each mode-selection attempt can stall unrelated file
+visits.  Keep explicit user remappings ahead of the automatic fallback."
+  (when mode
+    (when-let* ((recipe (treesit-auto--get-mode-recipe mode))
+                ((treesit-auto--ready-p mode))
+                ;; Emacs 32's PHP mode requires the embedded parsers too;
+                ;; the upstream recipe checks only the main PHP grammar.
+                ((or (not (eq (treesit-auto-recipe-ts-mode recipe) 'php-ts-mode))
+                     (< emacs-major-version 32)
+                     (chief/treesit-php-ready-p))))
+      (setq-local major-mode-remap-alist
+                  (append major-mode-remap-alist
+                          (mapcar
+                           (lambda (fallback)
+                             (cons fallback (treesit-auto-recipe-ts-mode recipe)))
+                           (ensure-list (treesit-auto-recipe-remap recipe))))))))
+
 (use-package treesit-auto
   :defer 1
   :config
   (setq treesit-auto-install nil)
+  (advice-add 'treesit-auto--set-major-remap :override #'chief/treesit-set-major-remap)
   ;; The current markdown tree-sitter grammar is crashing this Emacs build on
   ;; macOS inside `treesit--pre-redisplay', so keep Markdown on the classic
   ;; major mode for stability.

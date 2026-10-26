@@ -209,6 +209,10 @@
   :bind
   (("C-." . embark-act)
    ("C-;" . embark-dwim)
+   ;; These prefixes also work in minibuffers on legacy terminals that cannot
+   ;; distinguish modified punctuation; no terminal preference changes needed.
+   ("C-c ." . embark-act)
+   ("C-c ;" . embark-dwim)
    ("C-h B" . embark-bindings)))
 
 (use-package embark-consult

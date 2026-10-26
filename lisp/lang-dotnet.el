@@ -171,12 +171,12 @@ explicit restore commands when a project needs restored assets."
   :type 'directory
   :group 'chief-dotnet)
 
-(defcustom chief/dotnet-roll-forward "Major"
+(defcustom chief/dotnet-roll-forward "LatestMajor"
   "DOTNET_ROLL_FORWARD value used for editor-launched .NET tools.
 
-This lets maintained editor tools target an older supported .NET runtime while
-running on a newer installed runtime.  Set to nil to leave the variable
-unchanged."
+Use the newest installed runtime so MSBuild-based servers can load the SDK
+selected by dotnet, even when an older matching runtime is also installed.
+Set to nil to leave the variable unchanged."
   :type '(choice (const nil)
                  (const "Minor")
                  (const "Major")

@@ -64,6 +64,36 @@
     (gnus-group-news-low ((t (:inherit gnus-group-news-low-empty :weight bold)))))
   "Acyclic Gnus face specs used to prevent theme inheritance cycles.")
 
+(defun chief/theme-acyclic-gnus-face-arguments (arguments)
+  "Keep incoming Gnus and Org indentation faces acyclic across theme switches.
+Some themes reverse the inheritance between an empty group face and its
+nonempty counterpart.  Applying those faces one at a time can temporarily
+cycle against the previous definitions, before `enable-theme' runs.  Keep
+all explicit colors and styles, but anchor these faces directly to default."
+  (cons
+   (car arguments)
+   (mapcar
+    (lambda (spec)
+      (if (and (symbolp (car-safe spec))
+               (or (string-prefix-p "gnus-group-" (symbol-name (car spec)))
+                   (memq (car spec) '(org-hide org-indent))))
+          (cons (car spec)
+                (cons (mapcar
+                       (lambda (branch)
+                         (list (car branch)
+                               (plist-put (copy-sequence
+                                           (if (listp (cadr branch))
+                                               (cadr branch)
+                                             (cdr branch)))
+                                          :inherit 'default)))
+                       (cadr spec))
+                      (cddr spec)))
+        spec))
+    (cdr arguments))))
+
+(advice-add 'custom-theme-set-faces :filter-args
+            #'chief/theme-acyclic-gnus-face-arguments)
+
 (defun chief/theme-patch-theme-settings (theme)
   "Patch THEME settings that would break child-frame face recalculation."
   (when-let* ((settings (get theme 'theme-settings)))
@@ -243,12 +273,22 @@ frame parameters instead of only face backgrounds."
     (chief/theme--set-default-frame-parameter 'foreground-color fg)
     (chief/theme--set-default-frame-parameter 'background-mode mode)))
 
+(defun chief/theme--store-user-face-spec (face spec)
+  "Store user SPEC for FACE without discarding underlying theme definitions."
+  (put face 'theme-face
+       (cons (list 'user spec)
+             (assq-delete-all 'user (copy-sequence (get face 'theme-face))))))
+
 (defun chief/theme--apply-user-face-specs (face-specs)
   "Install FACE-SPECS as user-theme specs and update live faces."
   (dolist (face-spec face-specs)
-    (let ((face (car face-spec))
-          (spec (cadr face-spec)))
-      (put face 'theme-face `((user ,spec)))
+    (let* ((face (car face-spec))
+           (spec (copy-tree (cadr face-spec)))
+           (attributes (cadr (car spec))))
+      ;; Owned UI surfaces must not retain a theme's reversed inheritance edge.
+      (unless (plist-member attributes :inherit)
+        (setf (cadr (car spec)) (plist-put attributes :inherit 'default)))
+      (chief/theme--store-user-face-spec face spec)
       (when (facep face)
         (apply #'set-face-attribute face nil (cadr (car spec)))))))
 
@@ -314,7 +354,7 @@ switch to a light theme.  Syntax faces remain owned by the active theme."
       (treemacs-window-background-face ((t (:background ,bg :foreground ,fg))))
       (treemacs-file-face ((t (:background ,bg :foreground ,fg))))
       (treemacs-directory-face ((t (:inherit font-lock-function-name-face :background ,bg))))
-      (treemacs-directory-collapsed-face ((t (:inherit treemacs-directory-face :background ,bg))))
+      (treemacs-directory-collapsed-face ((t (:inherit default :foreground ,accent :background ,bg))))
       (treemacs-root-face ((t (:inherit font-lock-constant-face :background ,bg :underline t :weight bold :height 1.2))))
       (treemacs-git-unmodified-face ((t (:inherit treemacs-file-face :background ,bg))))
       (treemacs-hl-line-face ((t (:background ,hover :extend t))))
@@ -375,7 +415,7 @@ installed themes."
     ;; recomputed after theme enable/disable/load, so this is generic without
     ;; being tied to any installed theme or theme family.
     (dolist (face-spec face-specs)
-      (put (car face-spec) 'theme-face `((user ,(cadr face-spec)))))
+      (chief/theme--store-user-face-spec (car face-spec) (cadr face-spec)))
     ;; Update already-created/live frames immediately where the faces exist.
     (with-selected-frame (or frame (selected-frame))
       (dolist (face-spec face-specs)
@@ -396,7 +436,14 @@ specs before `after-make-frame-functions' can run."
   ;; so every future frame, including Corfu child frames, sees a safe face graph.
   ;; Using `custom-theme-set-faces' here can itself trigger face recalculation
   ;; while the cyclic theme specs are still present.
-  (chief/theme--apply-user-face-specs chief/theme-gnus-face-specs)
+  (chief/theme--apply-user-face-specs
+   (append chief/theme-gnus-face-specs
+           ;; Themes disagree on whether outline-N inherits org-level-N or the
+           ;; reverse. Keep heading colors/styles, but make ancestry stable.
+           (mapcar (lambda (level)
+                     `(,(intern (format "org-level-%d" level))
+                       ((t (:inherit default)))))
+                   (number-sequence 1 8))))
   (chief/theme-apply-ui-face-fixes frame)
   (chief/theme-apply-completion-face-fixes frame)
   (chief/theme-refresh-display))

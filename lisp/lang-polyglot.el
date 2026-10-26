@@ -615,6 +615,15 @@ SOURCE-LANGUAGE is sent to LLDB/GDB when supported.  ARGS are program args."
   :after geiser
   :defer t)
 
+(defun chief/racket-preserve-file-association ()
+  "Keep Geiser's autoloads from overriding the configured Racket integration."
+  (setq auto-mode-alist
+        (delete '("\\.rkt\\'" . scheme-mode) auto-mode-alist)))
+
+(chief/racket-preserve-file-association)
+(with-eval-after-load 'geiser-racket
+  (chief/racket-preserve-file-association))
+
 (chief/safe-use-package haskell-mode
   :mode ("\\.hs\\'" . haskell-mode)
   :mode ("\\.lhs\\'" . haskell-mode))
