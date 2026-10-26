@@ -307,7 +307,10 @@ masquerade as the primary language server for a buffer.")
            (session (lsp-session)))
       (setq-local default-directory canonical)
       (setq-local lsp-auto-guess-root nil)
-      (setq-local lsp-use-workspace-root-for-server-default-directory t)
+      ;; Use the explicit cwd above, rather than infer it a second time.
+      ;; lsp-workspace-root can return nil for external library files or
+      ;; symlinked file names, even though we have already selected a root.
+      (setq-local lsp-use-workspace-root-for-server-default-directory nil)
       (cl-pushnew canonical (lsp-session-folders session) :test #'equal)
       canonical)))
 

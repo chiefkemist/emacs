@@ -1,0 +1,29 @@
+diff --git a/src/sidecars/SharpLsp.Sidecar.CSharp/Debugging/HotReloadSession.cs b/src/sidecars/SharpLsp.Sidecar.CSharp/Debugging/HotReloadSession.cs
+index 0c6621d..5da3d45 100644
+--- a/src/sidecars/SharpLsp.Sidecar.CSharp/Debugging/HotReloadSession.cs
++++ b/src/sidecars/SharpLsp.Sidecar.CSharp/Debugging/HotReloadSession.cs
+@@ -83,6 +83,24 @@ internal sealed class HotReloadSession : IAsyncDisposable
+         var solution = project.Solution;
+         foreach (var loadedProject in project.Solution.Projects)
+         {
++            // MSBuild text loaders are lazy: freeze the built source before a
++            // save replaces it on disk, not when the first EnC emit reads it.
++            foreach (var document in loadedProject.Documents)
++            {
++                solution = solution.WithDocumentText(
++                    document.Id,
++                    await document.GetTextAsync(ct).ConfigureAwait(false),
++                    PreservationMode.PreserveValue
++                );
++            }
++            foreach (var document in loadedProject.AdditionalDocuments)
++            {
++                solution = solution.WithAdditionalDocumentText(
++                    document.Id,
++                    await document.GetTextAsync(ct).ConfigureAwait(false),
++                    PreservationMode.PreserveValue
++                );
++            }
+             if (loadedProject.OutputFilePath is { } assemblyPath)
+             {
+                 solution = solution.WithProjectCompilationOutputInfo(

@@ -73,6 +73,7 @@
         lang-polyglot
         lang-rescript
         lang-dotnet
+        lang-sharplsp
         lang-rust
         lang-lean
         lang-zig
