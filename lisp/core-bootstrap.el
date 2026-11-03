@@ -11,6 +11,9 @@
   :type 'boolean
   :group 'chief)
 
+;; Copy backups: renaming source files into backups triggers LSP file-move
+;; edits, which can rewrite JS/TS imports to point into the backup directory.
+(setq backup-by-copying t)
 (setq backup-directory-alist
       `(("." . ,(expand-file-name "backups/" chief/var-directory))))
 (setq auto-save-file-name-transforms

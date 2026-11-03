@@ -45,6 +45,10 @@ Racket's configured file association. Theme compatibility overlays retain the
 underlying palette and avoid cyclic Org/Gnus face inheritance during switches
 and terminal child-frame creation.
 
+Backups in `var/backups/` are copied, not moved. This prevents LSP from treating
+saves as file renames and rewriting JS/TS imports to backup paths; genuine file
+renames retain LSP import updates.
+
 ## Project-scoped SharpLsp (.NET)
 
 `lisp/lang-sharplsp.el` prefers SharpLsp for C#, F#, and Razor **only** beneath an
@@ -264,6 +268,7 @@ Run configuration tests with the installed package environment:
 
 ```sh
 emacs --module-assertions --batch --init-directory "$PWD" -l "$PWD/init.el" \
+  -l "$PWD/test/core-backup-test.el" \
   -l "$PWD/test/core-tools-test.el" \
   -l "$PWD/test/core-terminal-keyboard-test.el" \
   -l "$PWD/test/lang-dotnet-test.el" \
