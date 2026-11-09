@@ -2,6 +2,7 @@
 
 (require 'cl-lib)
 (require 'compile)
+(require 'core-dap)
 (require 'core-projects)
 (require 'json)
 (require 'project)
@@ -329,28 +330,7 @@ successful exit."
 (defun chief/zig-dap-debug (program name cwd &optional args)
   "Start a Zig DAP session for PROGRAM named NAME in CWD with ARGS."
   (require 'dap-mode)
-  (let ((configuration
-         (cond
-          ((featurep 'dap-lldb)
-           (list :type "lldb-vscode"
-                 :request "launch"
-                 :name name
-                 :program program
-                 :cwd cwd
-                 :args (or args [])
-                 :sourceLanguages ["zig"]))
-          ((featurep 'dap-gdb)
-           (list :type "gdb"
-                 :request "launch"
-                 :name name
-                 :program program
-                 :target program
-                 :cwd cwd
-                 :args (or args [])
-                 :sourceLanguages ["zig"]))
-          (t
-           (user-error "No Zig-capable DAP adapter is configured")))))
-    (dap-debug configuration)))
+  (dap-debug (chief/native-dap-configuration program name cwd ["zig"] args)))
 
 (defun chief/zig-debug-current-file ()
   "Compile the current Zig file with debug info and launch DAP."
@@ -511,6 +491,7 @@ successful exit."
     "tp" #'chief/zig-build-test
     "d" '(:ignore t :which-key "debug")
     "dd" #'chief/zig-debug-current-file
+    "de" #'chief/native-debug-executable
     "dt" #'chief/zig-debug-test-at-point
     "m" '(:ignore t :which-key "metadata")
     "mz" #'chief/zig-open-zls-config

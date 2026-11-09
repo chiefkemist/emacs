@@ -49,6 +49,47 @@ Backups in `var/backups/` are copied, not moved. This prevents LSP from treating
 saves as file renames and rewriting JS/TS imports to backup paths; genuine file
 renames retain LSP import updates.
 
+## Native debugging (C, C++, Zig)
+
+Set a source breakpoint with `SPC d b`, then use `SPC d d`. Toggling confirms
+"set" or "removed" in the echo area. A visible `[B?]` marks a pending/unverified
+breakpoint; `[B]` means the debugger verified it. These labels work in terminal
+and GUI frames. `SPC d l` lists breakpoints and their verification state.
+Markers are restored without requiring LSP, and closing an LSP buffer does not
+disable the debugger UI. Place breakpoints on executable statements; a crash
+before a later breakpoint prevents reaching that line.
+
+The picker includes explicit **C**, **C++**, and **Zig** entries for:
+
+- **Build and debug current file**: save and compile a standalone source file,
+  then launch the resulting executable only if compilation succeeds. C/C++ use
+  `cc`/`c++` with `-g -O0`; Zig uses `zig build-exe -O Debug`. Artifacts stay in
+  ignored `var/native-debug/` or `var/zig/`, not beside your source.
+- **Launch executable**: choose an already-built binary, its working directory,
+  and optional arguments (quote arguments containing spaces). For multi-file
+  projects, build with your project's normal build system and debug symbols
+  first, then use this option; for example, `zig build -Doptimize=Debug` and
+  select the executable under `zig-out/bin/`.
+
+Executable and working-directory paths (including `~/...`) are expanded before
+being sent to the adapter. LLDB's detailed launch errors are retained instead
+of appearing as `Initialize request failed: nil`.
+
+`SPC d n` steps over, `SPC d i` steps in, `SPC d o` steps out, `SPC d c` continues,
+and `SPC d q` disconnects. Launches run to your breakpoints rather than stopping
+in macOS's loader. Without a breakpoint, a short program may simply finish.
+
+C/C++ also provide `, d d` to build/debug the current file and `, d e` to choose
+an executable, in both classic and tree-sitter modes. Zig retains `, d d` for
+its current file and `, d t` for the test at point, and adds `, d e`.
+Customize `chief/native-c-command`, `chief/native-cpp-command`, and
+`chief/native-debug-extra-args` for standalone C/C++ compiler/linker options.
+
+The adapter is `lldb-dap` (or older `lldb-vscode`), including Xcode's binary
+found through `xcrun` on macOS; VS Code itself is not required. GDB 14+ built
+with DAP support is a fallback. Missing tools produce an error; nothing is
+installed automatically. Builds and executable launches currently run locally.
+
 ## Project-scoped SharpLsp (.NET)
 
 `lisp/lang-sharplsp.el` prefers SharpLsp for C#, F#, and Razor **only** beneath an
@@ -269,6 +310,7 @@ Run configuration tests with the installed package environment:
 ```sh
 emacs --module-assertions --batch --init-directory "$PWD" -l "$PWD/init.el" \
   -l "$PWD/test/core-backup-test.el" \
+  -l "$PWD/test/core-dap-test.el" \
   -l "$PWD/test/core-tools-test.el" \
   -l "$PWD/test/core-terminal-keyboard-test.el" \
   -l "$PWD/test/lang-dotnet-test.el" \
