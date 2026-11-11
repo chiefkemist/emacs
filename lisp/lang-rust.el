@@ -2,6 +2,7 @@
 
 (require 'cl-lib)
 (require 'compile)
+(require 'core-dap)
 (require 'core-projects)
 (require 'json)
 (require 'seq)
@@ -11,17 +12,42 @@
 (declare-function dap-debug "dap-mode" (debug-args))
 (declare-function lsp-get "lsp-mode" (hash key))
 (declare-function lsp-rust-analyzer--select-runnable "lsp-rust" ())
-(declare-function lsp-rust-analyzer-status "lsp-rust" ())
 (declare-function lsp-rust-analyzer-expand-macro "lsp-rust" ())
 (declare-function lsp-rust-analyzer-open-external-docs "lsp-rust" ())
 (defvar lsp-rust-analyzer--last-runnable)
 
 (defun chief/rust-crate-root ()
-  "Return the nearest Rust crate root for the current buffer."
-  (chief/project-preferred-root
-   '("Cargo.toml")
-   (chief/project-current-root)
-   default-directory))
+  "Return the nearest actual Cargo crate root, or nil outside Cargo."
+  (chief/project-nearest-marker-root '("Cargo.toml")))
+
+(defun chief/rust-standalone-p ()
+  "Return non-nil for a local Rust source outside Cargo or rust-project.json."
+  (and buffer-file-name
+       (string-match-p "\\.rs\\'" buffer-file-name)
+       (not (file-remote-p buffer-file-name))
+       (not (chief/project-nearest-marker-root '("Cargo.toml" "rust-project.json")))))
+
+(defun chief/rust-standalone-files ()
+  "Return standalone sources directly beside the current Rust file.
+Do not recursively discover neighboring Cargo projects.  Include the current
+file even before its first save.  Rust module children are resolved by the server."
+  (let* ((file (chief/rust-current-file))
+         (directory (file-name-directory file)))
+    (vconcat
+     (delete-dups
+      (cons file (seq-filter #'file-regular-p
+                             (directory-files directory t "\\.rs\\'")))))))
+
+(defun chief/rust-analyzer-standalone-options (options)
+  "Supply detached-file crates in rust-analyzer initialization OPTIONS."
+  (if (and (chief/rust-standalone-p)
+           (seq-empty-p (plist-get options :linkedProjects)))
+      (plist-put (copy-sequence options) :detachedFiles (chief/rust-standalone-files))
+    options))
+
+(with-eval-after-load 'lsp-rust
+  (advice-add 'lsp-rust-analyzer--make-init-options :filter-return
+              #'chief/rust-analyzer-standalone-options))
 
 (defun chief/rust-manifest-path (&optional root)
   "Return the Cargo manifest path for ROOT, if it exists."
@@ -59,13 +85,17 @@
   (chief/project-preferred-root
    (chief/rust-workspace-root)
    (chief/rust-crate-root)
+   '("rust-project.json")
+   (when (chief/rust-standalone-p)
+     (file-name-directory (chief/rust-current-file)))
    (chief/project-current-root)
    default-directory))
 
 (defun chief/rust-workspace-directory ()
   "Return the directory used for workspace-level Cargo commands."
   (or (chief/rust-workspace-root)
-      (chief/rust-project-root)))
+      (chief/rust-crate-root)
+      (user-error "No Cargo.toml: use the current-file build, check, run, or test commands")))
 
 (defun chief/rust-default-directory ()
   "Return the directory used for current-package Cargo commands."
@@ -340,12 +370,16 @@ symbols for debugger sessions."
          (format "--edition=%s" (chief/rust-current-edition))
          "--crate-name" (chief/rust-safe-crate-name file))
    (when test (list "--test"))
-   (when debug (list "-g"))
+   (unless (or test (chief/rust-current-file-has-main-p))
+     (list "--crate-type=lib"))
+   (when debug (list "-g" "-C" "opt-level=0"))
    (list file "-o" output)))
 
 (defun chief/rust-run-standalone-file ()
   "Compile and run the current Rust file directly with rustc."
   (interactive)
+  (unless (chief/rust-current-file-has-main-p)
+    (user-error "This file has no fn main; use the current-file test command instead"))
   (chief/rust-save-current-buffer)
   (let* ((file (chief/rust-current-file))
          (binary (chief/rust-standalone-binary-path))
@@ -390,7 +424,11 @@ standalone compilation."
 Output goes to BUFFER-NAME.  ON-SUCCESS is called with the output string when
 COMMAND exits with status 0."
   (let* ((directory (file-name-as-directory (expand-file-name directory)))
+         (default-directory directory)
+         (source-buffer (current-buffer))
          (buffer (get-buffer-create buffer-name)))
+    (when (process-live-p (get-buffer-process buffer))
+      (user-error "A Rust build is already running in %s" buffer-name))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (setq buffer-read-only nil)
@@ -414,54 +452,71 @@ COMMAND exits with status 0."
                                  (with-current-buffer (process-buffer process)
                                    (buffer-string)))))
                   (if success
-                      (funcall on-success output)
+                      (if (buffer-live-p source-buffer)
+                          (with-current-buffer source-buffer
+                            (funcall on-success output))
+                        (let ((default-directory directory))
+                          (funcall on-success output)))
                     (when (buffer-live-p (process-buffer process))
                       (display-buffer (process-buffer process)))
                     (message "%s failed with exit status %s" buffer-name status))))))))
       (set-process-query-on-exit-flag process nil)
       process)))
 
+(defun chief/rust-dap-configuration (program name cwd &optional args)
+  "Prepare Rust PROGRAM in CWD, including installed LLDB pretty-printers."
+  (let ((configuration (chief/native-dap-configuration program name cwd ["rust"] (vconcat args))))
+    (when (and (equal (plist-get configuration :type) "lldb-vscode")
+               (executable-find "rustc"))
+      (when-let* ((sysroot (ignore-errors (car (process-lines "rustc" "--print" "sysroot"))))
+                  (printer (expand-file-name "lib/rustlib/etc/lldb_lookup.py" sysroot))
+                  ((file-readable-p printer)))
+        ;; This is the same initialization used by rust-lldb.  No global LLDB
+        ;; settings are changed, and no third-party printers are downloaded.
+        (setq configuration
+              (plist-put configuration :initCommands
+                         (vector (concat "command script import " (prin1-to-string printer)))))))
+    configuration))
+
 (defun chief/rust-dap-debug (program name cwd &optional args)
   "Start a Rust DAP session for PROGRAM named NAME in CWD with ARGS."
   (require 'dap-mode)
-  (let ((configuration
-         (cond
-          ((featurep 'dap-lldb)
-           (list :type "lldb-vscode"
-                 :request "launch"
-                 :name name
-                 :program program
-                 :cwd cwd
-                 :args (or args [])
-                 :sourceLanguages ["rust"]))
-          ((featurep 'dap-gdb)
-           (list :type "gdb"
-                 :request "launch"
-                 :name name
-                 :program program
-                 :target program
-                 :cwd cwd
-                 :args (or args [])
-                 :sourceLanguages ["rust"]))
-          (t
-           (user-error "No Rust-capable DAP adapter is configured")))))
-    (dap-debug configuration)))
+  (dap-debug (chief/rust-dap-configuration program name cwd args)))
+
+(defun chief/rust-dap-populate (configuration)
+  "Build a standalone Rust file/test CONFIGURATION before launching DAP."
+  (unless (and buffer-file-name (derived-mode-p 'rust-mode 'rust-ts-mode))
+    (user-error "Open a Rust source file before using this template"))
+  (let* ((tests (plist-get configuration :chief-tests))
+         (test-path (plist-get configuration :chief-test-path))
+         (file (chief/rust-current-file))
+         (binary (chief/rust-standalone-binary-path (if tests "-tests-debug" "-debug")))
+         (args (when tests
+                 (append (when test-path (list test-path))
+                         (when (plist-get configuration :chief-exact) (list "--exact"))
+                         (list "--nocapture"))))
+         (launch (chief/rust-dap-configuration
+                  binary (format "Rust %s :: %s" (if tests "tests" "file")
+                                 (or test-path (file-name-nondirectory file)))
+                  (file-name-directory file) args)))
+    (unless (or tests (chief/rust-current-file-has-main-p))
+      (user-error "This file has no fn main; choose Rust :: Debug standalone tests"))
+    (chief/rust-save-current-buffer)
+    (apply-partially
+     #'chief/native-debug-build-and-start
+     (plist-put launch :chief-build-command (chief/rust-rustc-command file binary tests t)))))
+
+(with-eval-after-load 'dap-mode
+  (dap-register-debug-provider "chief-rust" #'chief/rust-dap-populate)
+  (dap-register-debug-template "Rust :: Debug standalone file" '(:type "chief-rust"))
+  (dap-register-debug-template "Rust :: Debug standalone tests"
+                               '(:type "chief-rust" :chief-tests t)))
 
 (defun chief/rust-debug-standalone-file ()
   "Compile the current Rust file with debug info and launch DAP."
   (interactive)
-  (chief/rust-save-current-buffer)
-  (let* ((file (chief/rust-current-file))
-         (binary (chief/rust-standalone-binary-path "-debug"))
-         (directory (file-name-directory file)))
-    (chief/rust-run-command-async
-     (chief/rust-rustc-command file binary nil t)
-     directory
-     "*rustc debug file*"
-     (lambda (_output)
-       (chief/rust-dap-debug binary
-                             (format "Rust file :: %s" (file-name-nondirectory file))
-                             directory)))))
+  (require 'dap-mode)
+  (dap-debug '(:type "chief-rust")))
 
 (defun chief/rust-artifact-matches-target-p (artifact target)
   "Return non-nil when Cargo ARTIFACT belongs to TARGET."
@@ -529,6 +584,13 @@ COMMAND exits with status 0."
   (chief/rust-debug-cargo-target
    (chief/rust-read-target "bin" "Debug Cargo bin: ")))
 
+(defun chief/rust-debug-dwim ()
+  "Debug a Cargo runnable, or the current standalone file/test harness."
+  (interactive)
+  (if (chief/rust-manifest-path)
+      (chief/rust-debug-runnable)
+    (chief/rust-debug-current-file)))
+
 (defun chief/rust-debug-current-file ()
   "Debug the current Rust file's main executable.
 Cargo bin/example targets use Cargo; other files with `fn main' use rustc."
@@ -539,8 +601,10 @@ Cargo bin/example targets use Cargo; other files with `fn main' use rustc."
     (chief/rust-debug-cargo-target (chief/rust-current-target '("bin" "example"))))
    ((chief/rust-current-file-has-main-p)
     (chief/rust-debug-standalone-file))
+   ((chief/rust-buffer-test-items)
+    (chief/rust-debug-standalone-tests))
    (t
-    (user-error "Current file is not a Cargo executable target and no `fn main' was found"))))
+    (user-error "Current file is not a Cargo executable target and no `fn main' or tests were found"))))
 
 (defun chief/rust-test-attribute-p (attribute)
   "Return non-nil when ATTRIBUTE marks a Rust test function."
@@ -749,24 +813,9 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
 (defun chief/rust-debug-standalone-tests (&optional test-path exact)
   "Compile current file as a test harness with debug info and launch DAP."
   (interactive)
-  (chief/rust-save-current-buffer)
-  (let* ((file (chief/rust-current-file))
-         (binary (chief/rust-standalone-binary-path "-tests-debug"))
-         (directory (file-name-directory file))
-         (args (append (when test-path (list test-path))
-                       (when exact (list "--exact"))
-                       (list "--nocapture"))))
-    (chief/rust-run-command-async
-     (chief/rust-rustc-command file binary t t)
-     directory
-     "*rustc debug tests*"
-     (lambda (_output)
-       (chief/rust-dap-debug binary
-                             (if test-path
-                                 (format "Rust test :: %s" test-path)
-                               (format "Rust tests :: %s" (file-name-nondirectory file)))
-                             directory
-                             args)))))
+  (require 'dap-mode)
+  (dap-debug (list :type "chief-rust" :chief-tests t
+                   :chief-test-path test-path :chief-exact exact)))
 
 (defun chief/rust-debug-cargo-test-selection (selection &optional test-path exact)
   "Build Cargo test executable for SELECTION and launch DAP."
@@ -807,10 +856,50 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
         (chief/rust-debug-cargo-test-selection selection test-path t)
       (chief/rust-debug-standalone-tests test-path t))))
 
-(defun chief/rust-build-project ()
-  "Run `cargo build' for the current Rust crate."
+(defun chief/rust-build-standalone-file (&optional check compiler)
+  "Build the current file without Cargo; CHECK emits only metadata.
+COMPILER optionally selects a rustc-compatible tool such as clippy-driver."
   (interactive)
-  (chief/rust-compile (chief/rust-command "build") "*cargo build*" (chief/rust-default-directory)))
+  (chief/rust-save-current-buffer)
+  (let* ((file (chief/rust-current-file))
+         (output (chief/rust-standalone-binary-path (if check "-check.rmeta" "-build")))
+         (command (chief/rust-rustc-command file output)))
+    (when compiler
+      (unless (executable-find compiler)
+        (user-error "%s is not available on PATH" compiler))
+      (setcar command compiler))
+    (chief/rust-compile (append command (when check '("--emit=metadata")))
+                        (if check "*rustc check file*" "*rustc build file*")
+                        (file-name-directory file))))
+
+(defun chief/rust-format-buffer ()
+  "Format the current buffer with rustfmt, without saving it or using Cargo."
+  (interactive)
+  (unless (executable-find "rustfmt")
+    (user-error "rustfmt is not available on PATH"))
+  (let ((source (current-buffer))
+        (output (generate-new-buffer " *rustfmt output*"))
+        (stderr (make-temp-file "chief-rustfmt-")))
+    (unwind-protect
+        (let ((status (call-process-region
+                       (point-min) (point-max) "rustfmt" nil (list output stderr) nil
+                       "--edition" (chief/rust-current-edition) "--emit" "stdout")))
+          (unless (and (integerp status) (zerop status))
+            (user-error "rustfmt failed: %s"
+                        (with-temp-buffer
+                          (insert-file-contents stderr)
+                          (string-trim (buffer-string)))))
+          (with-current-buffer source
+            (atomic-change-group (replace-buffer-contents output))))
+      (kill-buffer output)
+      (delete-file stderr))))
+
+(defun chief/rust-build-project ()
+  "Build the current Cargo crate or standalone Rust file."
+  (interactive)
+  (if (chief/rust-manifest-path)
+      (chief/rust-compile (chief/rust-command "build") "*cargo build*" (chief/rust-default-directory))
+    (chief/rust-build-standalone-file)))
 
 (defun chief/rust-build-workspace ()
   "Run `cargo build --workspace' for the current Rust workspace."
@@ -820,9 +909,11 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
                       (chief/rust-workspace-directory)))
 
 (defun chief/rust-check-project ()
-  "Run `cargo check' for the current Rust crate."
+  "Check the current Cargo crate or standalone Rust file."
   (interactive)
-  (chief/rust-compile (chief/rust-command "check") "*cargo check*" (chief/rust-default-directory)))
+  (if (chief/rust-manifest-path)
+      (chief/rust-compile (chief/rust-command "check") "*cargo check*" (chief/rust-default-directory))
+    (chief/rust-build-standalone-file t)))
 
 (defun chief/rust-check-workspace ()
   "Run `cargo check --workspace' for the current Rust workspace."
@@ -832,9 +923,11 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
                       (chief/rust-workspace-directory)))
 
 (defun chief/rust-test-project ()
-  "Run `cargo test' for the current Rust crate."
+  "Test the current Cargo crate or standalone Rust file."
   (interactive)
-  (chief/rust-compile (chief/rust-command "test") "*cargo test*" (chief/rust-default-directory)))
+  (if (chief/rust-manifest-path)
+      (chief/rust-compile (chief/rust-command "test") "*cargo test*" (chief/rust-default-directory))
+    (chief/rust-test-standalone-file)))
 
 (defun chief/rust-test-workspace ()
   "Run `cargo test --workspace' for the current Rust workspace."
@@ -844,23 +937,27 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
                       (chief/rust-workspace-directory)))
 
 (defun chief/rust-run-project ()
-  "Run `cargo run' for the current Rust crate."
+  "Run the current Cargo crate or standalone Rust file."
   (interactive)
-  (chief/rust-compile (chief/rust-command "run") "*cargo run*" (chief/rust-default-directory)))
+  (if (chief/rust-manifest-path)
+      (chief/rust-compile (chief/rust-command "run") "*cargo run*" (chief/rust-default-directory))
+    (chief/rust-run-current-file)))
 
 (defun chief/rust-format-project ()
-  "Run `cargo fmt --all' for the current Rust project."
+  "Format the Cargo workspace or current standalone Rust buffer."
   (interactive)
-  (chief/rust-compile (chief/rust-command "fmt" "--all")
-                      "*cargo fmt*"
-                      (chief/rust-workspace-directory)))
+  (if (chief/rust-manifest-path)
+      (chief/rust-compile (chief/rust-command "fmt" "--all")
+                          "*cargo fmt*" (chief/rust-workspace-directory))
+    (chief/rust-format-buffer)))
 
 (defun chief/rust-lint-project ()
-  "Run `cargo clippy' for the current Rust crate."
+  "Run Clippy for the Cargo crate or standalone Rust file."
   (interactive)
-  (chief/rust-compile (chief/rust-command "clippy" "--all-targets" "--all-features")
-                      "*cargo clippy*"
-                      (chief/rust-default-directory)))
+  (if (chief/rust-manifest-path)
+      (chief/rust-compile (chief/rust-command "clippy" "--all-targets" "--all-features")
+                          "*cargo clippy*" (chief/rust-default-directory))
+    (chief/rust-build-standalone-file t "clippy-driver")))
 
 (defun chief/rust-lint-workspace ()
   "Run `cargo clippy --workspace' for the current Rust workspace."
@@ -872,9 +969,10 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
 (defun chief/rust-run-runnable ()
   "Run the current rust-analyzer runnable."
   (interactive)
-  (if (fboundp 'lsp-rust-analyzer-run)
-      (call-interactively #'lsp-rust-analyzer-run)
-    (user-error "rust-analyzer runnable support is not available")))
+  (cond
+   ((chief/rust-standalone-p) (chief/rust-run-current-file))
+   ((fboundp 'lsp-rust-analyzer-run) (call-interactively #'lsp-rust-analyzer-run))
+   (t (user-error "rust-analyzer runnable support is not available"))))
 
 (defun chief/rust-debug-runnable ()
   "Debug a selected rust-analyzer runnable with this setup's DAP adapter."
@@ -912,6 +1010,14 @@ module-path filter.  Files outside Cargo use a standalone rustc test harness."
       (find-file manifest)
     (user-error "No Cargo.toml found for this buffer")))
 
+(defun chief/rust-analyzer-status ()
+  "Show rust-analyzer status using the required object-shaped parameters."
+  (interactive)
+  (unless (bound-and-true-p lsp-managed-mode)
+    (user-error "Rust LSP is not connected yet"))
+  (let ((status (lsp-request "rust-analyzer/analyzerStatus" (make-hash-table))))
+    (with-help-window "*rust-analyzer status*" (princ status))))
+
 (defun chief/rust-completion-setup ()
   "Enable Rust popup completion, including zero-prefix trigger completions.
 Rust completions often start after trigger characters such as `::' or `.'.  At
@@ -934,8 +1040,15 @@ auto-prefix to pop up module/member completions immediately."
     (lsp-completion-mode 1)))
 
 (defun chief/rust-mode-setup ()
-  "Configure Rust buffers."
-  (setq-local compile-command "cargo test")
+  "Configure Rust buffers, including sources without a Cargo manifest."
+  (setq-local compile-command
+              (cond
+               ((not buffer-file-name) "rustc")
+               ((chief/rust-manifest-path) "cargo test")
+               ((not (executable-find "rustc")) "rustc")
+               (t (chief/rust-shell-command
+                   (chief/rust-rustc-command (chief/rust-current-file)
+                                            (chief/rust-standalone-binary-path "-build"))))))
   (setq-local chief/lsp-root-function #'chief/rust-project-root)
   (setq-local lsp-enabled-clients '(rust-analyzer))
   (setq-local lsp-completion-enable t)
@@ -994,7 +1107,7 @@ auto-prefix to pop up module/member completions immediately."
     "tf" #'chief/rust-test-current-file
     "ts" #'chief/rust-test-standalone-file
     "d" '(:ignore t :which-key "debug")
-    "dd" #'chief/rust-debug-runnable
+    "dd" #'chief/rust-debug-dwim
     "df" #'chief/rust-debug-current-file
     "db" #'chief/rust-debug-bin
     "dt" #'chief/rust-debug-test-at-point
@@ -1002,6 +1115,8 @@ auto-prefix to pop up module/member completions immediately."
     "ds" #'chief/rust-debug-standalone-file
     "dS" #'chief/rust-debug-standalone-tests
     "dr" #'chief/rust-run-runnable
+    "dR" #'chief/rust-debug-runnable
+    "da" #'chief/rust-analyzer-status
     "dm" #'chief/rust-open-cargo-toml))
 
 (with-eval-after-load 'rust-ts-mode
@@ -1032,7 +1147,7 @@ auto-prefix to pop up module/member completions immediately."
     "tf" #'chief/rust-test-current-file
     "ts" #'chief/rust-test-standalone-file
     "d" '(:ignore t :which-key "debug")
-    "dd" #'chief/rust-debug-runnable
+    "dd" #'chief/rust-debug-dwim
     "df" #'chief/rust-debug-current-file
     "db" #'chief/rust-debug-bin
     "dt" #'chief/rust-debug-test-at-point
@@ -1040,11 +1155,12 @@ auto-prefix to pop up module/member completions immediately."
     "ds" #'chief/rust-debug-standalone-file
     "dS" #'chief/rust-debug-standalone-tests
     "dr" #'chief/rust-run-runnable
+    "dR" #'chief/rust-debug-runnable
     "dm" #'chief/rust-open-cargo-toml)
   (with-eval-after-load 'lsp-rust
     (chief/local-leader-def
       :keymaps 'rust-ts-mode-map
-      "da" #'lsp-rust-analyzer-status
+      "da" #'chief/rust-analyzer-status
       "de" #'lsp-rust-analyzer-expand-macro
       "do" #'lsp-rust-analyzer-open-external-docs)))
 

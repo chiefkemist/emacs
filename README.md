@@ -90,6 +90,46 @@ found through `xcrun` on macOS; VS Code itself is not required. GDB 14+ built
 with DAP support is a fallback. Missing tools produce an error; nothing is
 installed automatically. Builds and executable launches currently run locally.
 
+## Standalone Rust (no Cargo required)
+
+Local `.rs` files without an ancestor `Cargo.toml` or `rust-project.json` are
+supplied to rust-analyzer as detached crates. Only sibling `.rs` files are
+included, not nearby Cargo projects or the whole containing Git repository.
+No manifest or project file is generated in your source directory. Existing
+Cargo and explicit `linkedProjects` configurations retain their project model.
+
+Use `rust-analyzer` and `rust-src` from the selected Rust toolchain for standard
+library definitions and macro navigation. The config uses existing tools; it
+does not install a toolchain or dependencies automatically. After reloading
+this configuration, restart an already-running Rust LSP workspace with
+`M-x lsp-workspace-restart`. Also restart it after adding a new independent
+`.rs` crate to an already-connected directory, to refresh its detached-file list.
+
+Normal navigation is unchanged: `gd` for definitions, `SPC l R` for references,
+`SPC l r` for rename, and `SPC l f` for LSP formatting. With the local leader
+(`,` in command state), the same everyday commands now work outside Cargo:
+
+| Keys | Standalone action |
+| --- | --- |
+| `c b` / `c c` | Build / check the file with rustc |
+| `r r` | Compile and run the file's `fn main` |
+| `t f` / `t t` | Run file tests / the test at point |
+| `c f` | Format the current, possibly unsaved buffer with rustfmt |
+| `c l` | Check with clippy-driver |
+| `d d` | Build with debug symbols and launch the file (or its tests) |
+| `d t` / `d T` | Debug the test at point / the file's tests |
+| `d a` | Show rust-analyzer status |
+
+`SPC d d` also offers **Rust :: Debug standalone file** and
+**Rust :: Debug standalone tests**. Use `SPC d b` for breakpoints and the normal
+DAP stepping/locals controls. LLDB loads the selected toolchain's existing Rust
+pretty-printers for values such as String and Vec. Failed builds never launch an
+older executable; artifacts remain under ignored `var/rust/`. Cargo debugging
+keeps its runnable picker (`, d R` also selects it explicitly), while standalone
+debugging does not depend on Cargo runnables or an active LSP connection. Workspace-only Cargo
+commands require a real manifest. Standalone rustc supports the file and its
+modules; external crate dependencies still need an explicit build/project model.
+
 ## Project-scoped SharpLsp (.NET)
 
 `lisp/lang-sharplsp.el` prefers SharpLsp for C#, F#, and Razor **only** beneath an
@@ -315,6 +355,7 @@ emacs --module-assertions --batch --init-directory "$PWD" -l "$PWD/init.el" \
   -l "$PWD/test/core-terminal-keyboard-test.el" \
   -l "$PWD/test/lang-dotnet-test.el" \
   -l "$PWD/test/lang-scala-test.el" \
+  -l "$PWD/test/lang-rust-test.el" \
   -l "$PWD/test/lang-sharplsp-test.el" \
   -f ert-run-tests-batch-and-exit
 ```
